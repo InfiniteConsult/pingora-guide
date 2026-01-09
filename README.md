@@ -465,3 +465,156 @@ kill $(cat /tmp/pingora_02.pid)
 ```
 
 If you check the log file again, you should see the "Shutdown signal received" message, confirming the `ShutdownWatch` logic worked correctly.
+
+# Lesson 3: Graceful Shutdown
+
+In the previous lessons, stopping the server meant killing the process immediately. In a development environment, this is fine. In production, however, a hard stop is dangerous. You might interrupt a database write, corrupt a file, or drop a client connection in the middle of a request.
+
+Pingora provides a built-in **Graceful Shutdown** mechanism to handle this. When the server receives a specific signal (usually `SIGTERM`), it doesn't exit immediately. Instead:
+
+1. It broadcasts a shutdown event to all services.
+2. It stops accepting *new* connections (if using listeners).
+3. It waits for a configurable period (the `grace_period_seconds`) for services to finish their current work.
+4. If the grace period expires and services are still running, it forces a shutdown.
+
+### Key Concepts
+
+* **`ShutdownWatch`**: This is a Tokio `watch` channel provided to every service's `start()` method. Services must monitor this to know when to stop accepting new work and begin their cleanup.
+* **`grace_period_seconds`**: A setting in `ServerConf`. It defines the maximum time the server will wait for services to finish after a shutdown signal is received.
+* **Signal Handling**: Pingora distinguishes between two types of shutdown:
+* **Fast Shutdown (`SIGINT` / Ctrl+C)**: The server exits immediately. Use this during development or emergencies.
+* **Graceful Shutdown (`SIGTERM`)**: The server enters the graceful shutdown phase described above. This is the standard signal used by deployment tools like Kubernetes or systemd.
+
+
+
+### The Code (`examples/03_graceful_shutdown.rs`)
+
+We will build a "Batch Job" service. It simulates processing long-running tasks that take 20 seconds to complete.
+
+* If we used **Fast Shutdown** (Ctrl+C), the job would be cut off immediately.
+* By using **Graceful Shutdown** (SIGTERM) and checking `ShutdownWatch`, the service detects the signal, stops starting *new* jobs, but finishes the *current* job before exiting.
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::{Server, ShutdownWatch};
+use std::sync::Arc;
+use std::time::Duration;
+use pingora::services::background::BackgroundService;
+use tokio::time::sleep;
+
+
+pub struct BatchJobService;
+
+#[async_trait]
+impl BackgroundService for BatchJobService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        info!("BatchJob Service started. Waiting for jobs");
+        let mut job_id = 0;
+
+        loop {
+            // 1. Check before starting work
+            // If shutdown is requested, we break the loop immediately so no new jobs start.
+            if *shutdown.borrow() {
+                info!("Shutdown requested. No new jobs will be started.");
+                break;
+            }
+
+            job_id += 1;
+            info!("Starting Job #{} (simulated 20s duration)...", job_id);
+
+            // 2. Run the job with cancellation awareness
+            // We use tokio::select! to listen for the shutdown signal WHILE the job is running.
+            let job_duration = Duration::from_secs(20);
+            tokio::select! {
+                // The "Happy Path": The job finishes normally
+                _ = sleep(job_duration) => {
+                    info!("Job #{} completed successfully.", job_id);
+                }
+
+                // The "Shutdown Path": Signal received mid-job
+                _ = shutdown.changed() => {
+                    warn!("Shutdown signal received while Job #{} is running!", job_id);
+                    warn!("Finishing Job #{} before exiting...", job_id);
+                    
+                    // 3. Simulate wrapping up critical work (e.g., flushing buffers)
+                    // In a real app, this ensures we don't leave data in a corrupt state.
+                    sleep(Duration::from_secs(10)).await;
+                    info!("Job #{} completed gracefully during shutdown.", job_id);
+                    
+                    // Now we break the loop to allow the service to exit
+                    break;
+                }
+            }
+
+            // Brief pause between jobs
+            sleep(Duration::from_secs(1)).await;
+        }
+        info!("BatchJob Service has stopped cleanly.");
+    }
+}
+
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+
+    // 4. Configure the Grace Period
+    // We set this to 10 seconds. Pingora will wait up to this long for
+    // BatchJobService to exit. If we didn't set this, the server might exit
+    // before our cleanup logic finishes.
+    if let Some(conf) = Arc::get_mut(&mut my_server.configuration) {
+        conf.grace_period_seconds = Some(10);
+    }
+    my_server.bootstrap();
+
+    let service = background_service("BatchJobService", BatchJobService);
+    my_server.add_service(service);
+
+    info!("Server running. Send SIGTERM to trigger graceful shutdown (e.g. 'pkill -TERM -f 03_graceful_shutdown').");
+    my_server.run_forever();
+}
+
+```
+
+### Running the Lesson
+
+To verify this lesson, we need to send specific signals to the process. We will test both the graceful path and the fast path.
+
+#### 1. Test Graceful Shutdown (The Happy Path)
+
+We want to confirm that if we stop the server while a job is running, it finishes that job.
+
+1. **Start the Server**:
+   ```bash
+   RUST_LOG=info cargo run --example 03_graceful_shutdown
+   ```
+2. **Wait for a Job to Start**:
+   Watch the logs until you see `Starting Job #1...`.
+3. **Send SIGTERM**:
+   Open a **second terminal** window and run:
+   ```bash
+   pkill -TERM -f 03_graceful_shutdown
+   ```
+4. **Observe the Logs**:
+   Back in the first terminal, you should see the shutdown sequence.
+   * Pingora logs `SIGTERM received, gracefully exiting`.
+   * Our service logs `Shutdown signal received... Finishing Job #1`.
+   * **Crucially**, the server *waits* for the job to finish (`Job #1 completed gracefully`) before the process actually exits.
+
+#### 2. Test Fast Shutdown (The Emergency Path)
+
+We want to confirm that we can still force-kill the server if needed.
+
+1. **Start the Server**:
+   ```bash
+   RUST_LOG=info cargo run --example 03_graceful_shutdown
+   ```
+2. **Wait for a Job to Start**.
+3. **Press** `Ctrl+C`: This sends `SIGINT`.
+4. **Observe the Logs**:
+   The server should exit **immediately**. You will see `SIGINT received, exiting`, but you will *not* see the "Finishing Job" or "Job completed" messages. The work was abandoned instantly.
