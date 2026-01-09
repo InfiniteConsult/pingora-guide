@@ -737,3 +737,148 @@ Run the server and observe the logs. You are looking for proof that two differen
    ```
 
 If `work_stealing` were enabled (default), you might see the same ThreadId for both, or the IDs swapping, depending on how Tokio schedules the tasks. With `work_stealing = false`, these tasks are rigidly pinned to their respective threads.
+
+# Lesson 5: Background Services & Shared State
+
+Real-world proxies rarely run in isolation. They need to report metrics, fetch dynamic configurations, or perform health checks on upstream servers. These tasks must run continuously but independently of the request-handling logic.
+
+Pingora provides the **`BackgroundService`** trait for these scenarios. Unlike a `ListeningService` (which waits for incoming network connections), a background service runs an arbitrary loop.
+
+In this lesson, we build a **Traffic Monitor**. It consists of two parts running in parallel:
+
+1. **Traffic Service**: Accepts TCP connections and increments a shared counter.
+2. **Metric Exporter**: A background service that wakes up every 2 seconds to read and log the current connection count.
+
+### Key Concepts
+
+#### 1. Shared State with `Arc`
+
+To share data between the Traffic Service (which writes) and the Exporter (which reads), we wrap our state struct in an `Arc` (Atomic Reference Counted smart pointer). This allows multiple threads to own a reference to the same memory location safely.
+
+#### 2. Atomic Operations & Memory Ordering
+
+Since multiple threads access the `connection_count` simultaneously, we cannot use a simple `usize`. We must use `AtomicUsize`.
+
+When reading or writing atomic variables, we must specify a **Memory Ordering**. This tells the CPU and compiler how strictly they must synchronize this operation with other memory operations. In our example, we used `Ordering::Relaxed`.
+
+* **`Ordering::Relaxed`**: "I only care that this specific variable is updated atomically. I don't care about the order of *other* memory operations around it."
+  * *Why use it here?* We are just counting numbers. If the "Exporter" sees the count update 5 nanoseconds later than it actually happened, or if it sees the updates out of perfect chronological order with unrelated variables, it doesn't matter. It is the fastest option.
+* **`Ordering::SeqCst` (Sequential Consistency)**: "Every thread must see all operations in the exact same global order."
+  * *Why avoid it here?* It forces heavy synchronization barriers on the CPU, slowing down performance unnecessarily for a simple counter.
+* **`Ordering::Acquire` / `Release**`: Used for locks. "If I see this flag set (Acquire), I am guaranteed to see all the data you wrote before you set the flag (Release)."
+
+#### 3. `BackgroundService` Lifecycle
+
+A background service receives a `ShutdownWatch` in its `start()` method. It is critical to check this watcher (usually via `tokio::select!`). If you ignore it, your background loop will keep running forever, preventing the server from shutting down gracefully.
+
+### The Code (`examples/05_background_services.rs`)
+
+We define a shared `AppState` and pass clones of it to both services. The `Traffic` service simulates handling requests by incrementing the counter and writing a response. The `MetricExporter` wakes up periodically to read that counter.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::{Server, ShutdownWatch};
+use pingora::services::background::BackgroundService;
+use pingora::services::listening::Service;
+use pingora::protocols::Stream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::time::interval;
+
+/// Shared state between the Traffic Service and the Background Service.
+struct AppState {
+    connection_count: AtomicUsize,
+}
+
+// --- 1. Traffic Handling Service ---
+
+#[derive(Clone)]
+pub struct CounterApp {
+    state: Arc<AppState>,
+}
+
+#[async_trait]
+impl pingora::apps::ServerApp for CounterApp {
+    async fn process_new(
+        self: &Arc<Self>,
+        mut stream: Stream,
+        _shutdown: &ShutdownWatch,
+    ) -> Option<Stream> {
+        // Increment the shared counter.
+        // We use Relaxed because we don't rely on this value to synchronize other data.
+        let count = self.state.connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        info!("Traffic: New connection handled. Count is now {}", count);
+
+        let response = format!("Hello! You are visitor #{}\n", count);
+        let _ = stream.write_all(response.as_bytes()).await;
+        
+        // Return None to close the connection immediately
+        None
+    }
+}
+
+// --- 2. Background Metric Exporter ---
+
+pub struct MetricExporter {
+    state: Arc<AppState>,
+}
+
+#[async_trait]
+impl BackgroundService for MetricExporter {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        // Run every 2 seconds
+        let mut period = interval(Duration::from_secs(2));
+        info!("Exporter: Service started.");
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    info!("Exporter: Shutdown requested.");
+                    break;
+                }
+                _ = period.tick() => {
+                    // Read the shared state
+                    let count = self.state.connection_count.load(Ordering::Relaxed);
+                    info!("Exporter: Current Total Connections: {}", count);
+                }
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Initialize shared state
+    let state = Arc::new(AppState { 
+        connection_count: AtomicUsize::new(0) 
+    });
+
+    // 1. Setup the Traffic Service (Port 6145)
+    let traffic_logic = CounterApp { state: state.clone() };
+    let mut traffic_service = Service::new("Traffic".to_string(), traffic_logic);
+    traffic_service.add_tcp("0.0.0.0:6145");
+
+    // 2. Setup the Background Service
+    let exporter_logic = MetricExporter { state: state.clone() };
+    // 'background_service' is a helper that wraps our struct into a Pingora Service
+    let background_service = background_service("MetricExporter", exporter_logic);
+
+    // 3. Add both to the server
+    my_server.add_service(traffic_service);
+    my_server.add_service(background_service);
+
+    info!("Server started. Traffic on port 6145. Metrics in logs.");
+    my_server.run_forever();
+}
+```
