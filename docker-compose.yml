@@ -1,0 +1,89 @@
+services:
+  # --- 1. The Developer Station ---
+  # This is where you will attach to run 'cargo run'
+  dev:
+    build:
+      context: .
+      dockerfile: docker/dev.Dockerfile
+    container_name: pingora_dev
+    hostname: dev.pingora.local
+    user: "1000:1000"
+    volumes:
+      - .:/app
+      - ./conf/keys:/keys:ro         # Read-only certs
+    networks:
+      pingora_net:
+        ipv4_address: 172.28.0.10
+    environment:
+      - RUST_LOG=info
+      - SSL_CERT_FILE=/keys/ca.crt
+
+  # --- 2. The Clients (Traffic Generators) ---
+  # Two distinct IPs to test Rate Limiting & IP Filtering
+  client_1:
+    image: wbitt/network-multitool
+    container_name: pingora_client_1
+    hostname: client1.pingora.local
+    volumes:
+      - ./conf/keys:/keys:ro
+    networks:
+      pingora_net:
+        ipv4_address: 172.28.0.30
+
+  client_2:
+    image: wbitt/network-multitool
+    container_name: pingora_client_2
+    hostname: client2.pingora.local
+    volumes:
+      - ./conf/keys:/keys:ro
+    networks:
+      pingora_net:
+        ipv4_address: 172.28.0.31
+
+  # --- 3. Basic Upstreams (Echo Servers) ---
+  # Simple HTTP for Load Balancing & Failover tests
+  upstream_blue:
+    image: hashicorp/http-echo
+    hostname: blue.pingora.local
+    command: ["-text='Response from BLUE'", "-listen=:8080"]
+    networks:
+      pingora_net:
+        ipv4_address: 172.28.0.20
+
+  upstream_green:
+    image: hashicorp/http-echo
+    hostname: green.pingora.local
+    command: ["-text='Response from GREEN'", "-listen=:8080"]
+    networks:
+      pingora_net:
+        ipv4_address: 172.28.0.21
+
+  # --- 4. Advanced Upstream (The Specialist) ---
+  # Handles HTTPS, mTLS, HTTP/2 (H2C), and Cache Headers
+  upstream_advanced:
+    image: nginx:alpine
+    container_name: upstream_advanced
+    hostname: advanced.pingora.local
+    volumes:
+      - ./conf/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf/keys:/etc/nginx/certs:ro
+    networks:
+      pingora_net:
+        ipv4_address: 172.28.0.22
+
+  # --- 5. gRPC Upstream ---
+  # Dedicated gRPC server for Module 3
+  upstream_grpc:
+    image: moul/grpcbin
+    container_name: upstream_grpc
+    hostname: grpc.pingora.local
+    networks:
+      pingora_net:
+        ipv4_address: 172.28.0.23
+
+networks:
+  pingora_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

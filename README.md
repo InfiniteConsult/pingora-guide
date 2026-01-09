@@ -1,3 +1,98 @@
+# Quick Start: The "Pingora City" Lab
+
+To ensure a consistent environment for these tutorials, we have created a deterministic network topology using Docker Compose. This "Pingora City" simulates a real-world infrastructure with multiple clients, distinct upstreams (HTTP, HTTPS, gRPC, H2C), and a dedicated development station.
+
+### 1. Setup & Installation
+
+**Prerequisites:** Docker and Docker Compose.
+
+First, generate the Certificate Authority and service certificates. This populates `conf/keys/` with the TLS assets required for the advanced lessons.
+
+```bash
+# 1. Generate Certificates (Root CA, Server, Client, Upstream)
+chmod +x scripts/00-setup-certs.sh
+./scripts/00-setup-certs.sh
+
+# 2. Build and Launch the City
+docker compose up -d --build
+
+```
+
+### 2. The Developer Environment
+
+You do not need Rust installed on your host machine. We have a dedicated `dev` container (Debian Bookworm) with a pre-configured Rust toolchain, OpenSSL, and network utilities.
+
+**Enter the Dev Container:**
+
+```bash
+docker exec -it pingora_dev bash
+
+```
+
+**Verify Compilation (Run Example 05):**
+Once inside, run the "Background Services" example. This acts as a smoke test to ensure `cargo` can compile the project and bind to the network.
+
+```bash
+# Inside pingora_dev
+RUST_LOG=info cargo run --example 05_background_services
+
+```
+
+*Wait for the "Server started" log message, then press `Ctrl+C` to exit the process.*
+
+**Verify Internal Network Reachability:**
+We have provided a script to verify that the Dev station can reach all upstream services via both Static IP and DNS.
+
+```bash
+# Inside pingora_dev
+./scripts/validate-dev.sh
+
+```
+
+*You should see green `OK` statuses for Blue, Green, Advanced (Nginx), and gRPC upstreams.*
+
+Type `exit` to return to your host terminal.
+
+### 3. Verification & Connectivity Test
+
+From your **host machine**, run the `validate-others.sh` script. This automation script will:
+
+1. Start `example 05_background_services` in the background on the Dev container.
+2. Instruct **Client 1** and **Client 2** to connect to the server.
+3. Verify that both clients (with distinct IPs) successfully received a response.
+4. Verify the server logs to confirm traffic handling.
+5. Send a `SIGTERM` to the server to test graceful shutdown.
+
+```bash
+# On Host
+chmod +x scripts/validate-others.sh
+./scripts/validate-others.sh
+
+```
+
+### 4. Network Topology & Services
+
+The lab runs on a fixed subnet `172.28.0.0/24`. All containers mount the `conf/keys` directory to trust the local Root CA.
+
+| Service | Hostname | Static IP | Role & Features |
+| --- | --- | --- | --- |
+| **Dev Station** | `dev.pingora.local` | `172.28.0.10` | **Your Workstation.** Rust toolchain, code bind-mount. Runs your Proxy. |
+| **Upstream Blue** | `blue.pingora.local` | `172.28.0.20` | **Basic HTTP.** Returns "Response from BLUE" on port 8080. |
+| **Upstream Green** | `green.pingora.local` | `172.28.0.21` | **Basic HTTP.** Returns "Response from GREEN" on port 8080. |
+| **Advanced Upstream** | `advanced.pingora.local` | `172.28.0.22` | **Nginx.** Supports:<br>
+
+<br>• Port 80: HTTP (Caching headers)<br>
+
+<br>• Port 443: HTTPS<br>
+
+<br>• Port 8443: Mutual TLS (mTLS)<br>
+
+<br>• Port 8081: HTTP/2 Cleartext (H2C) |
+| **gRPC Upstream** | `grpc.pingora.local` | `172.28.0.23` | **gRPC.** `grpcbin` server listening on TCP 9000. |
+| **Client 1** | `client1.pingora.local` | `172.28.0.30` | **Traffic Generator.** Simulates User A. |
+| **Client 2** | `client2.pingora.local` | `172.28.0.31` | **Traffic Generator.** Simulates User B (Useful for IP Rate Limiting). |
+
+
 # Lesson 0: The Raw Event Loop
 
 In this first lesson, we strip away the HTTP layer to understand the heart of Pingora: the **Event Loop**.
