@@ -1,0 +1,6 @@
+---
+version: 1
+threads: 2
+pid_file: "/tmp/pingora_lesson_01.pid"
+upgrade_sock: "/tmp/pingora_upgrade_01.sock"
+error_log: "/tmp/pingora_error.log"

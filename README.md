@@ -178,3 +178,146 @@ To verify that your raw TCP server is working correctly, we will use `telnet` (s
    ```
 5. **Check Logs**:
    In your first terminal, you should see logs indicating a new connection was established, and a closure log when you exited `telnet`.
+
+# Lesson 1: Configuration & Lifecycle
+
+In Lesson 0, we built a server that ran with default settings. However, production services rarely run on defaults. They need to define how many worker threads to use, where to write error logs, where to store PID files, and how to handle process upgrades.
+
+Pingora handles this "infrastructure" configuration separately from your traffic handling logic. This separation allows the framework to manage the process lifecycle (daemonization, restarts, upgrades) standardly across all Pingora applications.
+
+### Key Concepts
+
+1. **`Opt`**: This struct represents command-line arguments. Pingora provides a standard parser (via `clap`) that handles flags like `-c` (config file), `-d` (daemon mode), and `-u` (upgrade).
+2. **`ServerConf`**: This struct holds the runtime configuration for the server process. It includes settings for:
+   * **Threading**: `threads` and `work_stealing`.
+   * **Process Management**: `pid_file`, `upgrade_sock`, `user`, `group`.
+   * **Logging**: `error_log`.
+   * **SSL/Network**: `ca_file`, `upstream_keepalive_pool_size`.
+3. **`Server::new`**: This constructor is the bridge. It takes the command-line options (`Opt`), attempts to load the configuration file specified by `-c`, merges it with defaults, and returns a fully initialized `Server` instance.
+
+### The Code (`examples/01_configuration.rs`)
+
+In this example, we build a "dummy" server. Its only purpose is to load a configuration file and print the resulting settings to the console so we can verify that Pingora is correctly parsing our input.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::{Server, ShutdownWatch};
+use pingora::services::listening::Service;
+use std::sync::Arc;
+use pingora::protocols::Stream;
+
+#[derive(Clone)]
+pub struct ConfigDemoApp;
+
+#[async_trait]
+impl pingora::apps::ServerApp for ConfigDemoApp {
+    async fn process_new(
+        self: &Arc<Self>,
+        _stream: Stream,
+        _shutdown: &ShutdownWatch
+    ) -> Option<Stream> {
+        // For this lesson, we don't process traffic.
+        // We return None to close the connection immediately.
+        None
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize logging
+    env_logger::init();
+
+    // 2. Parse Command Line Arguments
+    // This allows us to pass `-c conf/01_config.yaml` or `-d` (daemon mode)
+    let opt = Opt::parse_args();
+
+    // 3. Initialize Server with Options
+    // Server::new will attempt to load the config file specified in `opt.conf`.
+    // If the file is missing or invalid, this will return an Error.
+    let mut my_server = Server::new(Some(opt))?;
+    let conf = &my_server.configuration;
+
+    // 4. Inspect the Loaded Configuration
+    info!("--- Configuration Loaded ---");
+    info!("  version: {}", conf.version);
+    info!("  daemon: {}", conf.daemon);
+    info!("  error_log: {:?}", conf.error_log);
+    info!("  pid_file: {}", conf.pid_file);
+    info!("  upgrade_sock: {}", conf.upgrade_sock);
+    info!("  user: {:?}", conf.user);
+    info!("  group: {:?}", conf.group);
+    info!("  threads: {}", conf.threads);
+    info!("  listener_tasks_per_fd: {}", conf.listener_tasks_per_fd);
+    info!("  work_stealing: {}", conf.work_stealing);
+    info!("  ca_file: {:?}", conf.ca_file);
+    info!("  grace_period_seconds: {:?}", conf.grace_period_seconds);
+    info!("  graceful_shutdown_timeout_seconds: {:?}", conf.graceful_shutdown_timeout_seconds);
+
+    info!("  client_bind_to_ipv4: {:?}", conf.client_bind_to_ipv4);
+    info!("  client_bind_to_ipv6: {:?}", conf.client_bind_to_ipv6);
+    info!("  upstream_keepalive_pool_size: {}", conf.upstream_keepalive_pool_size);
+    info!("  upstream_connect_offload_threadpools: {:?}", conf.upstream_connect_offload_threadpools);
+    info!("  upstream_connect_offload_thread_per_pool: {:?}", conf.upstream_connect_offload_thread_per_pool);
+    info!("  upstream_debug_ssl_keylog: {}", conf.upstream_debug_ssl_keylog);
+    info!("  max_retries: {}", conf.max_retries);
+    info!("----------------------------");
+
+    // 5. Bootstrap the server
+    my_server.bootstrap();
+
+    // 6. Setup a dummy service (required to run the server)
+    let mut service = Service::new("ConfigDemo".to_string(), ConfigDemoApp);
+    service.add_tcp("0.0.0.0:6143");
+    my_server.add_service(service);
+
+    info!("Starting server. Verify the thread count in the logs above matches your YAML.");
+    my_server.run_forever();
+}
+
+```
+
+### Running the Lesson
+
+#### 1. Define a Configuration File
+
+Create a file at `conf/01_config.yaml` with the following content. We specifically set `threads` to 2 to differentiate it from the default (which is usually 1 or the number of cores depending on environment).
+
+```yaml
+---
+version: 1
+threads: 2
+pid_file: "/tmp/pingora_lesson_01.pid"
+upgrade_sock: "/tmp/pingora_upgrade_01.sock"
+error_log: "/tmp/pingora_error.log"
+
+```
+
+#### 2. Run with Defaults
+
+First, run without arguments. Pingora will use its internal defaults.
+
+```bash
+RUST_LOG=info cargo run --example 01_configuration
+
+```
+
+You should see `threads: 1` and `pid_file: /tmp/pingora.pid`.
+
+#### 3. Run with Configuration
+
+Now, pass the configuration file.
+
+```bash
+RUST_LOG=info cargo run --example 01_configuration -- -c conf/01_config.yaml
+
+```
+
+You should see the values change to match your YAML file:
+
+* `threads: 2`
+* `pid_file: /tmp/pingora_lesson_01.pid`
+* `error_log: Some("/tmp/pingora_error.log")`
+
+This confirms that the `Server` has successfully bootstrapped itself using your external configuration.
