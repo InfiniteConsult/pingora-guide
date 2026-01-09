@@ -1,0 +1,6 @@
+---
+version: 1
+daemon: true
+pid_file: "/tmp/pingora_02.pid"
+error_log: "/tmp/pingora_02.log"
+upgrade_sock: "/tmp/pingora_upgrade_02.sock"

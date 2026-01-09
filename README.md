@@ -321,3 +321,147 @@ You should see the values change to match your YAML file:
 * `error_log: Some("/tmp/pingora_error.log")`
 
 This confirms that the `Server` has successfully bootstrapped itself using your external configuration.
+
+# Lesson 2: Daemon Mode & Background Services
+
+In production environments, servers are rarely run in the foreground attached to a terminal session. They run as **daemons**—background processes that survive user logouts and system restarts.
+
+Pingora has built-in support for daemonization. It handles the low-level Unix operations required to detach from the terminal (forking, setsid), manages process ID (PID) files, and redirects standard output/error streams to log files.
+
+This lesson also introduces the **`BackgroundService`**. Unlike the `ListeningService` from Lesson 0 (which accepts network connections), a `BackgroundService` runs an arbitrary task loop. This is useful for sidecar processes, metric exporters, or health check runners that need to live alongside your proxy logic.
+
+### Key Concepts
+
+1. **Daemonization Configuration**:
+   * **`daemon: true`**: Tells Pingora to fork into the background.
+   * **`pid_file`**: The path where the server writes its Process ID. External tools (like `systemd` or `monit`) use this to track and stop the server.
+   * **`error_log`**: In daemon mode, `stdout` and `stderr` are closed. This setting redirects logs to a file so they aren't lost.
+2. **`BackgroundService`**: A trait for tasks that run continuously until the server shuts down. It receives a `ShutdownWatch` to know when to exit gracefully.
+3. **`background_service` Helper**: A utility function in the prelude that wraps your custom logic into a generic service container, saving you from implementing boilerplate.
+
+### The Code (`examples/02_daemon_mode.rs`)
+
+This example defines a `HeartbeatService` that logs a message every second. We check the `shutdown` signal in the loop to ensure we stop immediately when the server receives a `SIGTERM`.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::{Server, ShutdownWatch};
+use pingora::services::background::BackgroundService;
+use std::time::Duration;
+use tokio::time::interval;
+
+pub struct HeartbeatService;
+
+#[async_trait]
+impl BackgroundService for HeartbeatService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let mut period = interval(Duration::from_secs(1));
+        info!("Heartbeat service started. PID: {}", std::process::id());
+
+        loop {
+            tokio::select! {
+                // Wait for shutdown signal
+                _ = shutdown.changed() => {
+                    info!("Shutdown signal received. Stopping heartbeat.");
+                    break;
+                }
+                // Or wait for the next tick
+                _ = period.tick() => {
+                    info!("Beep... (PID: {})", std::process::id());
+                }
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Inform the user if we are about to detach
+    if my_server.configuration.daemon {
+        println!("Preparing to daemonize. Logs will be redirected to: {:?}", my_server.configuration.error_log);
+        println!("Check the PID file at: {}", my_server.configuration.pid_file);
+    } else {
+        println!("Running in foreground mode. Pass '-d' or use config file to daemonize.");
+    }
+
+    let heartbeat = HeartbeatService;
+    // Helper to wrap our logic in a Service container
+    let service = background_service("Heartbeat", heartbeat);
+
+    my_server.add_service(service);
+    my_server.run_forever();
+}
+
+```
+
+### Running the Lesson
+
+To test daemonization, we must use a configuration file, as the behavior changes significantly from the default foreground mode.
+
+#### 1. Define the Daemon Configuration
+
+Create `conf/02_daemon.yaml`. We set `daemon: true` and define paths for logs and the PID file.
+
+```yaml
+---
+version: 1
+daemon: true
+pid_file: "/tmp/pingora_02.pid"
+error_log: "/tmp/pingora_02.log"
+upgrade_sock: "/tmp/pingora_upgrade_02.sock"
+
+```
+
+#### 2. Start the Daemon
+
+Run the server with the configuration.
+
+```bash
+RUST_LOG=info cargo run --example 02_daemon_mode -- -c conf/02_daemon.yaml
+
+```
+
+The program will print "Preparing to daemonize..." and then **exit immediately**. This is expected; the parent process exits while the child process continues in the background.
+
+#### 3. Verify Background Execution
+
+The server is now running silently. You can verify this by checking the PID file or listing processes.
+
+```bash
+# Read the PID
+cat /tmp/pingora_02.pid
+
+# Check if the process exists
+ps -p $(cat /tmp/pingora_02.pid)
+
+```
+
+#### 4. Check the Logs
+
+Since the process is detached, you won't see "Beep..." in your terminal. Tail the log file to see the output.
+
+```bash
+tail -f /tmp/pingora_02.log
+
+```
+
+You should see the heartbeat messages appearing every second.
+
+#### 5. Stop the Daemon
+
+To stop the server gracefully, send a `SIGTERM` to the process ID stored in the PID file.
+
+```bash
+kill $(cat /tmp/pingora_02.pid)
+
+```
+
+If you check the log file again, you should see the "Shutdown signal received" message, confirming the `ShutdownWatch` logic worked correctly.
