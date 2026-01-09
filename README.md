@@ -618,3 +618,122 @@ We want to confirm that we can still force-kill the server if needed.
 3. **Press** `Ctrl+C`: This sends `SIGINT`.
 4. **Observe the Logs**:
    The server should exit **immediately**. You will see `SIGINT received, exiting`, but you will *not* see the "Finishing Job" or "Job completed" messages. The work was abandoned instantly.
+
+# Lesson 4: Threading Models
+
+Pingora offers two distinct threading models (runtimes) to execute your services. Choosing the right one is critical for performance tuning, as it dictates how your CPU cores are utilized and how tasks are scheduled.
+
+### The Two Flavors
+
+1. **Work Stealing (`Steal`)**:
+   * **What it is:** This is the standard Tokio multi-threaded runtime behavior. All worker threads share a global queue of tasks. If one thread finishes its work early, it "steals" tasks from other busy threads.
+   * **Pros:** Excellent handling of uneven workloads. If one request takes 500ms and others take 1ms, the idle threads pick up the slack, preventing the system from stalling.
+   * **Cons:** Higher overhead due to synchronization (locking) between threads. This "chatter" can become a bottleneck at very high throughputs (e.g., 100k+ RPS).
+   * **Default:** `true` in `ServerConf`.
+2. **Shared-Nothing (`NoSteal`)**:
+   * **What it is:** This is Pingora's specialized optimization. Instead of one large runtime, Pingora spawns a separate, single-threaded Tokio runtime for *each* CPU core/thread configured. Incoming connections are sharded (distributed) to these threads. Once a connection belongs to a thread, it stays there.
+   * **Pros:** Zero contention. Thread A never locks Thread B. This mimics the architecture of Nginx (one worker per core) and maximizes CPU cache locality.
+   * **Cons:** Susceptible to "head-of-line blocking." If Thread A gets a heavy CPU-bound job, it cannot offload pending tasks to Thread B, even if Thread B is idle.
+   * **Use Case:** High-throughput proxies where request latency is uniform (IO-bound).
+
+### The Code (`examples/04_threading_model.rs`)
+
+In this lesson, we programmatically toggle the threading model to `NoSteal` (disabling work stealing) and set the thread count to 2.
+
+We then spawn two background services. Because we are in `NoSteal` mode, Pingora will distribute these services across the available independent runtimes. We print the `ThreadId` to verify that they are indeed running on different OS threads without moving between them.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::{Server, ShutdownWatch};
+use pingora::services::background::BackgroundService;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use tokio::time::interval;
+
+/// A service that simply announces which thread it is running on.
+pub struct ThreadReporterService;
+
+#[async_trait]
+impl BackgroundService for ThreadReporterService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        // We set the interval to 1 second so logs don't flood the console
+        let mut period = interval(Duration::from_secs(1));
+        
+        info!("ThreadReporter started.");
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            
+            // This print will show us WHICH OS thread is executing this task.
+            // In a 'Steal' runtime, this ID might change if the task moves (rare but possible).
+            // In a 'NoSteal' runtime, this task is pinned to one specific thread forever.
+            let thread_id = thread::current().id();
+            let thread_name = thread::current().name().unwrap_or("unnamed").to_string();
+            
+            info!("I am running on thread: {:?} ({})", thread_id, thread_name);
+
+            period.tick().await;
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+
+    // 1. Configure the Threading Model
+    // Access the configuration via Arc::get_mut to modify it before bootstrapping.
+    if let Some(conf) = Arc::get_mut(&mut my_server.configuration) {
+        // Set the number of worker threads to 2 so we can see concurrency.
+        conf.threads = 2;
+        
+        // Disable work stealing. This switches Pingora to the "Shared-Nothing" model.
+        // Each of the 2 threads will run its own independent single-threaded runtime.
+        conf.work_stealing = false;
+    }
+
+    my_server.bootstrap();
+
+    // 2. Add multiple services
+    // We add TWO instances of the same service. 
+    // In a NoSteal runtime with 2 threads, Pingora will attempt to distribute 
+    // these services across the available runtimes.
+    let reporter_a = background_service("Reporter-A", ThreadReporterService);
+    let reporter_b = background_service("Reporter-B", ThreadReporterService);
+
+    my_server.add_service(reporter_a);
+    my_server.add_service(reporter_b);
+
+    info!("Server starting with work_stealing = False.");
+    my_server.run_forever();
+}
+
+```
+
+### Verification
+
+Run the server and observe the logs. You are looking for proof that two different Operating System threads are active.
+
+1. **Run the Example**:
+   ```bash
+   RUST_LOG=info cargo run --example 04_threading_model
+   ```
+2. **Analyze the Output**:
+   You should see two different `ThreadId` values appearing in the logs.
+   ```text
+   INFO  04_threading_model > Server starting with work_stealing = False.
+   INFO  04_threading_model > ThreadReporter started.
+   INFO  04_threading_model > ThreadReporter started.
+   INFO  04_threading_model > I am running on thread: ThreadId(2) (BG Reporter-B)
+   INFO  04_threading_model > I am running on thread: ThreadId(3) (BG Reporter-A)
+   ```
+
+If `work_stealing` were enabled (default), you might see the same ThreadId for both, or the IDs swapping, depending on how Tokio schedules the tasks. With `work_stealing = false`, these tasks are rigidly pinned to their respective threads.
