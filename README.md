@@ -79,15 +79,7 @@ The lab runs on a fixed subnet `172.28.0.0/24`. All containers mount the `conf/k
 | **Dev Station** | `dev.pingora.local` | `172.28.0.10` | **Your Workstation.** Rust toolchain, code bind-mount. Runs your Proxy. |
 | **Upstream Blue** | `blue.pingora.local` | `172.28.0.20` | **Basic HTTP.** Returns "Response from BLUE" on port 8080. |
 | **Upstream Green** | `green.pingora.local` | `172.28.0.21` | **Basic HTTP.** Returns "Response from GREEN" on port 8080. |
-| **Advanced Upstream** | `advanced.pingora.local` | `172.28.0.22` | **Nginx.** Supports:<br>
-
-<br>• Port 80: HTTP (Caching headers)<br>
-
-<br>• Port 443: HTTPS<br>
-
-<br>• Port 8443: Mutual TLS (mTLS)<br>
-
-<br>• Port 8081: HTTP/2 Cleartext (H2C) |
+| **Advanced Upstream** | `advanced.pingora.local` | `172.28.0.22` | **Nginx.** Supports: <br><br>• Port 80: HTTP (Caching headers)<br><br>• Port 443: HTTPS<br><br>• Port 8443: Mutual TLS (mTLS)<br><br>• Port 8081: HTTP/2 Cleartext (H2C) |
 | **gRPC Upstream** | `grpc.pingora.local` | `172.28.0.23` | **gRPC.** `grpcbin` server listening on TCP 9000. |
 | **Client 1** | `client1.pingora.local` | `172.28.0.30` | **Traffic Generator.** Simulates User A. |
 | **Client 2** | `client2.pingora.local` | `172.28.0.31` | **Traffic Generator.** Simulates User B (Useful for IP Rate Limiting). |
@@ -1024,3 +1016,139 @@ Use `pkill -TERM -f 05_background_services` (or `Ctrl+C` if you don't mind the f
 ```bash
 pkill -TERM -f 05_background_services
 ```
+
+
+
+
+# Module 2: The Proxy Logic
+
+We have established the foundation of running a Pingora server. Now, we move to the core utility of the framework: **HTTP Proxying**.
+
+**Important: The Lab Environment**
+From this module onwards, all examples must be run inside the `pingora_dev` Docker container. The examples rely on the deterministic network topology of "Pingora City" to connect to upstream services (like `blue.pingora.local`) and receive traffic from clients.
+
+If you are not inside the container yet, enter it now:
+
+```bash
+docker exec -it pingora_dev bash
+
+```
+
+---
+
+## Lesson 6: The Simple Forwarder
+
+A "Simple Forwarder" or "Dumb Proxy" is the most basic proxy implementation. It accepts a request from a downstream client and forwards it to a single, hardcoded upstream server. It does not perform load balancing, authentication, or complex routing.
+
+This lesson introduces the **`ProxyHttp`** trait, which is the primary interface for building HTTP proxies in Pingora.
+
+### Key Concepts
+
+1. **`ProxyHttp` Trait**: This is the heart of any HTTP proxy service. It provides hooks into the request lifecycle (request arrival, upstream selection, response filtering, etc.).
+2. **`upstream_peer()`**: This is the only *mandatory* hook you must implement (besides `new_ctx`). It tells Pingora *where* to send the current request.
+3. **`HttpPeer`**: A struct defining the destination. It includes the IP/Port, whether to use TLS, and the SNI (Server Name Indication).
+4. **`upstream_request_filter()`**: An optional hook that runs *after* the peer is selected but *before* the request is sent. This is the place to modify headers (e.g., setting the `Host` header).
+
+### The Code (`examples/06_simple_forward.rs`)
+
+We will build a proxy that listens on port `6146`. It will forward every request it receives to our lab's **Upstream Blue** (IP `172.28.0.20`, port `8080`).
+
+We also implement `upstream_request_filter` to rewrite the `Host` header. This is a best practice; many web servers (like Nginx) will reject requests if the `Host` header does not match their configuration, even if the IP is correct.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+
+// 1. Define the Proxy Logic
+pub struct SimpleProxy;
+
+#[async_trait]
+impl ProxyHttp for SimpleProxy {
+    // Context (CTX) is per-request state. We don't need it for a simple forwarder.
+    type CTX = ();
+
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 2. Define the Upstream Peer
+    // This hook is called for EVERY request.
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> pingora::Result<Box<HttpPeer>> {
+        // In our lab, Upstream Blue is at this fixed IP.
+        let addr = ("172.28.0.20", 8080);
+        
+        info!("Forwarding request to Upstream Blue ({:?})", addr);
+        
+        // Construct the peer. 
+        // - addr: The destination IP and Port.
+        // - false: Do not use TLS (Blue is a plaintext HTTP server).
+        // - "blue.pingora.local": The SNI (ignored for HTTP, but required by struct).
+        let peer = Box::new(HttpPeer::new(
+            addr,
+            false,
+            "blue.pingora.local".to_string()
+        ));
+        Ok(peer)
+    }
+
+    // 3. Modify headers before forwarding
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX
+    ) -> pingora::Result<()> {
+        // Rewrite the Host header to match the destination.
+        // Without this, the upstream sees the Host header sent by the client 
+        // (e.g., "172.28.0.10"), which might cause it to reject the request.
+        let _ = upstream_request.insert_header("Host", "blue.pingora.local");
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 4. Create the Service
+    // `http_proxy_service` is a helper that wraps our logic in a ready-to-use Service.
+    let mut my_proxy = http_proxy_service(
+        &my_server.configuration,
+        SimpleProxy
+    );
+
+    // 5. Configure the Listener
+    my_proxy.add_tcp("0.0.0.0:6146");
+
+    info!("Simple Proxy running on 0.0.0.0:6146 -> Forwarding to Upstream Blue");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+### Verification
+
+We verified this code by running the proxy in the `dev` container and generating traffic from `client_1` in a separate container.
+
+1. **Start the Proxy (in `pingora_dev`)**:
+   ```bash
+   RUST_LOG=info cargo run --example 06_simple_forward
+   ```
+   *Output:* `Simple Proxy running on 0.0.0.0:6146 -> Forwarding to Upstream Blue`
+2. **Generate Traffic (from Host)**:
+   We instructed `client_1` to curl our proxy's IP (`172.28.0.10`):
+   ```bash
+   docker exec -it pingora_client_1 curl -v http://172.28.0.10:6146
+   ```
+3. **Result**:
+   * **Client**: Received `200 OK` and the body `'Response from BLUE'`, confirming the traffic successfully traversed the proxy and reached the correct upstream.
+   * **Proxy Logs**: Showed `Forwarding request to Upstream Blue`, confirming the `upstream_peer` hook was executed.
