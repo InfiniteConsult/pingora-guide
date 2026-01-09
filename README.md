@@ -882,3 +882,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     my_server.run_forever();
 }
 ```
+
+### Verification
+
+We will verify that both services are running and successfully communicating via the shared state. Since `nc` (Netcat) is useful for testing network services, you may need to install it if you haven't already:
+
+```bash
+sudo apt install netcat-traditional
+```
+
+**1. Run the Server**
+Start your server with info-level logging enabled.
+
+```bash
+RUST_LOG=info cargo run --example 05_background_services
+```
+
+**2. Observe Initial Logs**
+You should see the "Exporter" logging `Current Total Connections: 0` every 2 seconds. This confirms the background service is running.
+
+```text
+INFO  05_background_services > Exporter: Service started.
+INFO  05_background_services > Exporter: Current Total Connections: 0
+```
+
+**3. Generate Traffic**
+Open a **second terminal** and connect to the traffic port a few times. Each connection will trigger the Traffic Service.
+
+```bash
+echo "hi" | nc localhost 6145
+echo "hi" | nc localhost 6145
+```
+
+**4. Observe State Update**
+Back in your first terminal, you should see the "Traffic" service log the new connections. Shortly after, the "Exporter" log should automatically reflect the new count, proving that the `Arc<AppState>` is successfully sharing data between the two services.
+
+```text
+INFO  05_background_services > Traffic: New connection handled. Count is now 1
+INFO  05_background_services > Traffic: New connection handled. Count is now 2
+INFO  05_background_services > Exporter: Current Total Connections: 2
+```
+
+**5. Graceful Stop**
+Use `pkill -TERM -f 05_background_services` (or `Ctrl+C` if you don't mind the fast shutdown) to confirm the background service exits cleanly.
+
+```bash
+pkill -TERM -f 05_background_services
+```
