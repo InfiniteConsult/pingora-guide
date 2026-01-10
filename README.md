@@ -2354,3 +2354,17 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6155
 * **Client Side**: `HTTP/1.1 200 OK`. The client (curl) spoke HTTP/1.1 to the proxy.
 * **Proxy Logs**: `Forwarding to Upstream Advanced via H2C`.
 * **Body**: `Response from Advanced Upstream (H2C - Cleartext HTTP/2)`. This specific body text confirms that we successfully hit the Nginx server block listening on port 8081.
+
+
+# Module 3: Upstream Management
+
+In the previous modules, we focused on the request lifecycle—how the proxy accepts, routes, and modifies traffic from the client. Now, we turn our attention to the **Upstream**: the backend services your proxy protects and serves.
+
+A production proxy rarely talks to a single, static IP address. It must navigate dynamic environments where services scale up and down, reside behind secure TLS layers, or communicate over specialized protocols like gRPC and WebSockets.
+
+In this module, we will explore the mechanics of connectivity. You will learn how to:
+
+* **Discover Peers**: Switch from hardcoded IPs to dynamic DNS resolution and Unix Domain Sockets.
+* **Secure Connections**: Manage TLS handshakes, SNI routing, and Mutual TLS (mTLS) authentication.
+* **Handle Advanced Protocols**: Tunnel traffic via `CONNECT`, upgrade connections for WebSockets, and proxy gRPC streams.
+* **Tune Performance**: optimize connection reuse (Keep-Alive) and configure granular timeouts to ensure resilience.
