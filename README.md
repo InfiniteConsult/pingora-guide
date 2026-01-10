@@ -2471,3 +2471,104 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6160
 
 * **Response**: `200 OK` containing `'Response from BLUE'`.
 * **Logs**: You should see the log entry `Connecting to static peer: ("172.28.0.20", 8080)`. This confirms the `upstream_peer` hook executed and selected the correct hardcoded address.
+
+# Lesson 17: DNS Peer
+
+In dynamic environments like Kubernetes, AWS, or Docker, backend IP addresses change frequently. Hardcoding IPs is brittle; instead, we rely on DNS to resolve service names (e.g., `blue.pingora.local`) to their current IP addresses at runtime.
+
+### Key Concepts
+
+* **Async Resolution**: Standard Rust DNS resolution (`std::net::ToSocketAddrs`) is **blocking**. Using it inside Pingora's async runtime will freeze the worker thread, causing massive latency spikes. You **must** use an async resolver like `tokio::net::lookup_host`.
+* **Dynamic `HttpPeer`**: Instead of a static constant, we create the `HttpPeer` struct dynamically inside `upstream_peer` based on the result of the DNS lookup.
+* **Error Handling**: DNS lookups can fail (NXDOMAIN, timeouts). Robust proxies must catch these errors and return appropriate internal error codes.
+
+## The Code (`examples/17_dns_peer.rs`)
+
+We perform an asynchronous DNS lookup for `blue.pingora.local` and use the resolved IP to construct the peer connection.
+
+```rust
+use async_trait::async_trait;
+use log::{error, info};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use tokio::net::lookup_host;
+
+pub struct DnsPeerProxy;
+
+#[async_trait]
+impl ProxyHttp for DnsPeerProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let hostname = "blue.pingora.local";
+        let port = 8080;
+        let target = format!("{}:{}", hostname, port);
+
+        info!("Resolving host: {}", target);
+
+        // 1. Perform Async DNS Lookup
+        // We use tokio::net::lookup_host to avoid blocking the runtime.
+        let mut addrs = lookup_host(&target).await
+            .map_err(|_e| pingora::Error::new(ErrorType::Custom("DNSResolutionFailed")))?;
+
+        // 2. Select an Address
+        // A hostname might resolve to multiple IPs. We pick the first one.
+        if let Some(addr) = addrs.next() {
+            info!("Resolved {} -> {}", hostname, addr);
+            let peer = Box::new(HttpPeer::new(addr, false, hostname.to_string()));
+            Ok(peer)
+        } else {
+            error!("DNS lookup returned no records for {}", hostname);
+            Err(pingora::Error::new(ErrorType::Custom("DNSNoRecords")))
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, DnsPeerProxy);
+    my_proxy.add_tcp("0.0.0.0:6161");
+
+    info!("DNS Peer Proxy running on 0.0.0.0:6161");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We verify that the proxy correctly resolves the internal Docker DNS name to an IP address.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 17_dns_peer
+```
+
+### 2. Test Connection
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6161
+```
+
+### 3. Result Analysis
+
+* **Response**: `200 OK` from Upstream Blue.
+* **Logs**:
+   ```text
+   INFO  Resolving host: blue.pingora.local:8080
+   INFO  Resolved blue.pingora.local -> 172.28.0.20:8080
+   ```
+
+The logs confirm that `lookup_host` successfully returned the internal IP address `172.28.0.20`.
