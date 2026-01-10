@@ -2103,3 +2103,139 @@ The body should be our custom JSON:
 ```json
 {"status": "error", "code": 400, "message": "We caught a custom error!"}
 ```
+
+# Lesson 14: HTTP/2 Support
+
+HTTP/2 (H2) is a major upgrade to the HTTP protocol, introducing binary framing, header compression (HPACK), and multiplexing (multiple requests over one TCP connection).
+
+Pingora supports HTTP/2 on both sides of the proxy:
+
+1. **Downstream (Client → Proxy)**: Negotiated via TLS ALPN (Application-Layer Protocol Negotiation).
+2. **Upstream (Proxy → Backend)**: Configured explicitly in the `HttpPeer` options.
+
+In this lesson, we configure **End-to-End HTTP/2**. We will proxy traffic from an H2 client to our "Advanced" Nginx upstream, which is also listening on H2.
+
+## Key Concepts
+
+* **ALPN (Application-Layer Protocol Negotiation)**: An extension to TLS where the client sends a list of supported protocols (e.g., `h2`, `http/1.1`) during the handshake. The server selects one. To enable this in Pingora, we call `tls_settings.enable_h2()`.
+* **`ALPN` Enum**: When connecting to an upstream, we must tell Pingora which protocols to offer.
+  * `ALPN::H2H1`: Prefer HTTP/2, but fallback to HTTP/1.1 (safest).
+  * `ALPN::H2`: Force HTTP/2.
+* **`SSL_CERT_FILE`**: Pingora uses OpenSSL (via `boringssl`). It respects standard environment variables. Because our Docker container has `SSL_CERT_FILE=/keys/ca.crt` set, Pingora automatically trusts our lab's local Certificate Authority. We do *not* need to disable certificate verification manually.
+
+## The Code (`examples/14_http2_support.rs`)
+
+We configure the listener on port `6154` to accept H2. We configure the upstream peer to target `advanced.pingora.local:443` (our Nginx container) and offer H2.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::listeners::tls::TlsSettings;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::{ALPN, HttpPeer};
+use std::path::Path;
+
+pub struct Http2Proxy;
+
+#[async_trait]
+impl ProxyHttp for Http2Proxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Target the "Advanced" Nginx upstream on port 443 (HTTPS)
+        let addr = ("172.28.0.22", 443);
+        
+        // true = Enable TLS for the upstream connection
+        let mut peer = Box::new(HttpPeer::new(
+            addr,
+            true,
+            "advanced.pingora.local".to_string(),
+        ));
+        
+        // Offer HTTP/2 to the upstream, fallback to HTTP/1.1
+        peer.options.alpn = ALPN::H2H1;
+
+        info!("Forwarding to Upstream Advanced via HTTPS (ALPN: H2/H1)");
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Nginx requires the Host header to match the server_name
+        upstream_request.insert_header("Host", "advanced.pingora.local")?;
+        Ok(())
+    }
+}
+
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, Http2Proxy);
+
+    // 1. Configure Downstream TLS
+    let cert_path = "/keys/server.crt";
+    let key_path = "/keys/server.key";
+
+    if !Path::new(cert_path).exists() {
+        return Err(format!("Missing keys at {}", cert_path).into());
+    }
+
+    let mut tls_settings = TlsSettings::intermediate(cert_path, key_path)?;
+    
+    // CRITICAL: This enables H2 negotiation with the Client
+    tls_settings.enable_h2();
+    
+    my_proxy.add_tls_with_settings("0.0.0.0:6154", None, tls_settings);
+
+    info!("HTTP/2 Proxy running on 0.0.0.0:6154");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We verify that the connection uses HTTP/2 using `curl`.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=debug cargo run --example 14_http2_support
+```
+
+*Note: We use `debug` logs to see the ALPN handshake details.*
+
+### 2. Test with Curl
+
+From the host machine, we run `curl` inside the client container. We use the `--http2` flag to encourage H2 usage.
+
+```bash
+docker exec -it pingora_client_1 curl -v --http2 \
+  --cacert /keys/ca.crt \
+  https://dev.pingora.local:6154
+```
+
+### 3. Result Analysis
+
+* **Handshake**: You should see `ALPN: server accepted h2`.
+* **Protocol**: `using HTTP/2`.
+* **Certificate**: `SSL certificate verify ok`. This confirms that our `SSL_CERT_FILE` environment variable correctly pointed to the CA, allowing the client to trust the proxy, and the proxy to trust the upstream.
+* **Response**: `Response from Advanced Upstream (HTTPS + HTTP/2)`.
