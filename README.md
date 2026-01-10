@@ -1271,3 +1271,139 @@ To verify TLS termination, we need a client that trusts our lab's self-signed Ce
    * **ALPN**: If verified, you may see `ALPN: offers h2,http/1.1`.
    * **Response**: `Response from BLUE`.
    * **Proxy Logs**: `Forwarding HTTPS request to Upstream Blue`.
+
+# Lesson 8: Header Manipulation
+
+One of the most common tasks for an API Gateway is to modify traffic as it passes through. You might need to sanitize requests (removing sensitive headers like internal tokens), tag traffic (adding request IDs for tracing), or modify responses (adding security headers like CORS or `Strict-Transport-Security`).
+
+Pingora provides specific hooks in the `ProxyHttp` trait to inspect and mutate headers at different stages of the request lifecycle.
+
+### Key Concepts
+
+1. **`upstream_request_filter`**: This hook runs *after* the upstream peer has been selected but *before* the request is sent to the backend. It allows you to modify the `RequestHeader`.
+   * *Use cases:* Adding authentication tokens, removing client-identifying info (scrubbing), or rewriting the `Host` header.
+2. **`response_filter`**: This hook runs *after* the response receives the headers from the backend but *before* the body is streamed to the client. It allows you to modify the `ResponseHeader`.
+   * *Use cases:* Hiding backend server versions (`Server: nginx/1.18`), adding custom watermarks, or fixing caching headers.
+
+
+
+### The Code (`examples/08_header_manipulation.rs`)
+
+In this lesson, we proxy traffic to **Upstream Green** (172.28.0.21). We perform the following manipulations:
+
+* **Request Phase**: We inject `X-Pingora-Proxy: true` so the backend knows the request came via our gateway. We also remove the `User-Agent` header to anonymize the client.
+* **Response Phase**: We inject `X-Edited-By: Pingora` into the response headers so the client can verify the gateway handled the traffic.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::http::ResponseHeader;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+
+pub struct HeaderModProxy;
+
+#[async_trait]
+impl ProxyHttp for HeaderModProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> pingora::Result<Box<HttpPeer>> {
+        let addr = ("172.28.0.21", 8080);
+        let peer = Box::new(HttpPeer::new(
+            addr,
+            false,
+            "green.pingora.local".to_string()
+        ));
+        Ok(peer)
+    }
+
+    // 1. Modify the REQUEST (Client -> Proxy -> Upstream)
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX
+    ) -> pingora::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Set the Host header to match the upstream
+        upstream_request.insert_header("Host", "green.pingora.local")?;
+        
+        // Add a custom header for the backend to see
+        upstream_request.insert_header("X-Pingora-Proxy", "true")?;
+        
+        // Remove the User-Agent header for privacy
+        let _ = upstream_request.remove_header("User-Agent");
+        
+        info!("Request headers modified: Added X-Pingora-Proxy, Removed User-Agent.");
+        Ok(())
+    }
+
+    // 2. Modify the RESPONSE (Upstream -> Proxy -> Client)
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Add a custom header so the client knows who handled this
+        upstream_response.insert_header("X-Edited-By", "Pingora")?;
+        
+        info!("Response headers modified: Added X-Edited-By");
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, HeaderModProxy);
+    
+    // Bind to port 6148
+    my_proxy.add_tcp("0.0.0.0:6148");
+
+    info!("Header Manipulation Proxy running on 0.0.0.0:6148 -> Forwarding to Upstream Green");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+### Verification
+
+To verify that the headers are being modified, we inspect the traffic from the client side.
+
+1. **Start the Proxy (in `pingora_dev`)**:
+   ```bash
+   RUST_LOG=info cargo run --example 08_header_manipulation
+   ```
+   *Output:* `Header Manipulation Proxy running on 0.0.0.0:6148`
+2. **Test from Client (from Host)**:
+   Run `curl -v` against port `6148`. We use verbose mode to see the response headers.
+   ```bash
+   docker exec -it pingora_client_1 curl -v http://172.28.0.10:6148
+   ```
+3. **Result Analysis**:
+   * **Body**: You should see `Response from GREEN`.
+   * **Headers**: In the response section (lines starting with `<`), you should see our custom header:
+   ```text
+   < X-Edited-By: Pingora
+   ```
+* **Proxy Logs**: The console running the proxy will confirm the hooks executed:
+   ```text
+   INFO  Request headers modified: Added X-Pingora-Proxy, Removed User-Agent.
+   INFO  Response headers modified: Added X-Edited-By
+   ```
