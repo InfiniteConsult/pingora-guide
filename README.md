@@ -1945,3 +1945,161 @@ docker exec -it pingora_client_1 curl -v -X POST -d "I am a rogue agent" http://
 WARN  Security Alert: Forbidden content 'rogue' detected in body!
 ERROR Fail to proxy: SecurityPolicyViolation ...
 ```
+
+# Lesson 13: Custom Errors
+
+In production environments, returning generic error pages (like `502 Bad Gateway` or `500 Internal Server Error`) provides a poor user experience. Modern APIs and web applications expect structured error responses—typically JSON for APIs (`{"error": "message"}`) or branded HTML pages for browsers.
+
+Pingora provides a dedicated hook, **`fail_to_proxy`**, which acts as a global catch-all for any error that occurs during the request lifecycle. This allows you to inspect the error cause and generate a custom response before closing the connection.
+
+## Key Concepts
+
+* **`fail_to_proxy`**: This hook is triggered if any previous phase (e.g., `request_filter`, `upstream_peer`, `upstream_request_filter`) returns an `Err`. It replaces the default error handling logic.
+* **`ErrorType::Custom`**: You can generate your own errors using `pingora::Error::new(ErrorType::Custom("MyReason"))`. This allows you to "throw" specific exceptions (like "BlockedByWAF" or "MaintenanceMode") and "catch" them in the error handler to serve specific status codes.
+* **`FailToProxy` Struct**: The return type of this hook. It instructs the server on two things:
+  1. `error_code`: The HTTP status code to log internally.
+  2. `can_reuse_downstream`: Whether the TCP connection to the client is safe to reuse for another request (Keep-Alive). Usually, this is `false` for fatal errors.
+
+## The Code (`examples/13_custom_errors.rs`)
+
+We implement a proxy that normally forwards to **Upstream Blue**. However, if the user requests the path `/oops`, we intentionally raise a custom error. We then catch this error in `fail_to_proxy` and return a structured JSON response instead of a default error page.
+
+```rust
+use async_trait::async_trait;
+use log::{error, info};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::http::ResponseHeader;
+use pingora::proxy::FailToProxy;
+
+pub struct CustomErrorProxy;
+
+#[async_trait]
+impl ProxyHttp for CustomErrorProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let peer = Box::new(HttpPeer::new(
+            ("172.28.0.20", 8080),
+            false,
+            "blue.pingora.local".to_string(),
+        ));
+        Ok(peer)
+    }
+
+    // 1. Trigger an error intentionally
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if session.req_header().uri.path() == "/oops" {
+            // Raise a custom error. This immediately jumps to fail_to_proxy.
+            return Err(pingora::Error::new(ErrorType::Custom("SimulatedFailure")));
+        }
+        Ok(false)
+    }
+
+    // 2. Handle the error (The "Catch" block)
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora::Error,
+        _ctx: &mut Self::CTX
+    ) -> FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        error!("Entered fail_to_proxy with error: {:?}", e);
+
+        // Map the internal error to an HTTP Status Code
+        let code = if let ErrorType::Custom("SimulatedFailure") = e.etype {
+            400 // Bad Request
+        } else {
+            500 // Internal Server Error
+        };
+
+        // Construct the Custom JSON Response
+        let body = format!(
+            r#"{{"status": "error", "code": {}, "message": "We caught a custom error!"}}"#,
+            code
+        );
+        let content_length = body.len();
+
+        let mut header = ResponseHeader::build(code, Some(3)).unwrap();
+        header.insert_header("Content-Type", "application/json").unwrap();
+        header.insert_header("Content-Length", content_length.to_string()).unwrap();
+
+        // Write the response manually
+        // - false: end_of_stream is false because body follows
+        // - true: end_of_stream is true because this is the end
+        let _ = session.write_response_header(Box::new(header), false).await;
+        let _ = session.write_response_body(Some(body.into()), true).await;
+
+        // Return instruction to Pingora core
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false, // Close connection for safety
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, CustomErrorProxy);
+    my_proxy.add_tcp("0.0.0.0:6153");
+
+    info!("Custom Error Proxy running on 0.0.0.0:6153");
+    info!("Try: curl http://127.0.0.1:6153/oops");
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify both the standard success path and the custom error path.
+
+### 1. Start the Proxy
+
+Run the example inside the `pingora_dev` container:
+
+```bash
+RUST_LOG=info cargo run --example 13_custom_errors
+```
+
+### 2. Test Normal Request
+
+From the host machine, request the root path:
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6153
+```
+
+*Result:* `200 OK` from Upstream Blue.
+
+### 3. Test Custom Error
+
+From the host machine, request the trigger path `/oops`:
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6153/oops
+```
+
+*Result:* `400 Bad Request`.
+The body should be our custom JSON:
+
+```json
+{"status": "error", "code": 400, "message": "We caught a custom error!"}
+```
