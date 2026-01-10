@@ -2572,3 +2572,129 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6161
    ```
 
 The logs confirm that `lookup_host` successfully returned the internal IP address `172.28.0.20`.
+
+# Lesson 18: Unix Domain Socket (UDS) Peer
+
+In high-performance local environments—such as communicating with a sidecar proxy (e.g., Envoy, Linkerd) or a local PHP-FPM process—using TCP/IP can introduce unnecessary overhead. **Unix Domain Sockets (UDS)** allow processes on the same machine to communicate via the kernel without touching the network stack.
+
+Pingora supports proxying traffic to UDS endpoints natively. This is often used to offload TLS termination or WAF duties to Pingora while the application logic runs locally on a socket.
+
+## Key Concepts
+
+* **`HttpPeer::new_uds()`**: This constructor is distinct from the standard `new()`. It takes a file system path (e.g., `/tmp/upstream.sock`) instead of an IP address. Note that it returns a `Result`, so it must be unwrapped with `?`.
+* **The "Host" in UDS**: Even though we are connecting to a file, the HTTP protocol still requires a `Host` header. You must still provide a valid SNI/Host string (e.g., `"uds.local"`).
+* **Mocking in Rust**: Since our lab environment lacks a real UDS upstream (like a local Python server), we implement a mock upstream using `tokio::net::UnixListener`. Because Pingora controls the main thread, we spawn this mock server in a background thread with its own Tokio runtime.
+
+## The Code (`examples/18_uds_peer.rs`)
+
+We launch a background thread to act as the "Upstream Server," listening on `/tmp/upstream.sock`. The Proxy then accepts traffic on TCP port `6162` and tunnels it to that socket file.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
+
+pub struct UdsProxy;
+
+#[async_trait]
+impl ProxyHttp for UdsProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Connect to the Unix Domain Socket file
+        // Note: new_uds returns a Result, so we use '?'
+        let peer = Box::new(HttpPeer::new_uds(
+            "/tmp/upstream.sock",
+            false, // TLS is rarely used over UDS
+            "uds.local".to_string(),
+        )?);
+
+        info!("Forwarding to UDS: /tmp/upstream.sock");
+        Ok(peer)
+    }
+}
+
+// A simple Mock Server that listens on a Unix Socket
+async fn run_mock_uds_server(path: &'static str) {
+    // 1. Clean up old socket file if it exists
+    let _ = std::fs::remove_file(path);
+
+    // 2. Bind to the path
+    let listener = UnixListener::bind(path).expect("Failed to bind UDS");
+    info!("Mock Upstream running at {}", path);
+
+    // 3. Accept loop
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _addr)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Simple Read (drain request)
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    
+                    // Simple Write (static response)
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello via UDS";
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        }
+    });
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Spawn our mock upstream server in the background
+    // We use a separate thread + runtime to avoid conflicting with Pingora's main loop
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_mock_uds_server("/tmp/upstream.sock"));
+        std::thread::park(); // Keep the thread alive
+    });
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, UdsProxy);
+    my_proxy.add_tcp("0.0.0.0:6162");
+
+    info!("UDS Proxy running on 0.0.0.0:6162");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We verify that the proxy can bridge a standard TCP HTTP request to a local Unix Domain Socket.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 18_uds_peer
+```
+
+### 2. Test Connection
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6162
+```
+
+### 3. Result Analysis
+
+* **Logs**:
+   ```text
+   INFO  Mock Upstream running at /tmp/upstream.sock
+   INFO  Forwarding to UDS: /tmp/upstream.sock
+   ```
+* **Response**: `200 OK` with body `Hello via UDS`.
