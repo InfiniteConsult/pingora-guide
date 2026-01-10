@@ -2239,3 +2239,118 @@ docker exec -it pingora_client_1 curl -v --http2 \
 * **Protocol**: `using HTTP/2`.
 * **Certificate**: `SSL certificate verify ok`. This confirms that our `SSL_CERT_FILE` environment variable correctly pointed to the CA, allowing the client to trust the proxy, and the proxy to trust the upstream.
 * **Response**: `Response from Advanced Upstream (HTTPS + HTTP/2)`.
+
+# Lesson 15: H2C (HTTP/2 Cleartext)
+
+While HTTP/2 is almost exclusively used over HTTPS (TLS) on the public internet, the specification also defines a cleartext version known as **h2c**.
+
+**h2c** is widely used in internal infrastructure, particularly for **gRPC** microservices running inside a secure cluster (like Kubernetes). It allows services to benefit from HTTP/2's multiplexing and binary framing without the CPU overhead of encryption/decryption at every hop.
+
+In this lesson, we demonstrate **Protocol Translation**:
+
+* **Downstream (Client → Proxy)**: Standard HTTP/1.1.
+* **Upstream (Proxy → Backend)**: HTTP/2 Cleartext (h2c).
+
+## Key Concepts
+
+* **Forcing HTTP/2**: When using TLS, the protocol is negotiated via ALPN. With Cleartext, there is no handshake to negotiate the protocol. Therefore, we must explicitly tell Pingora to treat the connection as HTTP/2 immediately upon connecting.
+* **`ALPN::H2`**: By setting `peer.options.alpn = ALPN::H2` combined with `tls: false`, we instruct the connection pool to start the HTTP/2 "preface" sequence immediately.
+* **No Fallback**: Unlike `ALPN::H2H1`, there is no fallback mechanism here. If the upstream server does not speak H2C, the connection will fail instantly with a protocol error.
+
+## The Code (`examples/15_h2c_support.rs`)
+
+We configure the proxy to listen for standard HTTP traffic on port `6155`. It forwards requests to the lab's **Advanced Upstream** on port **8081**, which is configured to accept H2C traffic.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::{ALPN, HttpPeer};
+
+pub struct H2cProxy;
+
+#[async_trait]
+impl ProxyHttp for H2cProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // Target the "Advanced" Nginx upstream on port 8081 (H2C)
+        let addr = ("172.28.0.22", 8081);
+
+        // TLS is false (Cleartext)
+        let mut peer = Box::new(HttpPeer::new(
+            addr,
+            false, 
+            "advanced.pingora.local".to_string(),
+        ));
+        
+        // We must Force H2.
+        // There is no negotiation (ALPN) in Cleartext; we just send H2 frames.
+        peer.options.alpn = ALPN::H2;
+
+        info!("Forwarding to Upstream Advanced via H2C (Port 8081)");
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> 
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Nginx requires the Host header to match the server block
+        upstream_request.insert_header("Host", "advanced.pingora.local")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, H2cProxy);
+
+    // We accept standard HTTP/1.1 on the front end for simplicity
+    my_proxy.add_tcp("0.0.0.0:6155");
+
+    info!("Proxy running on 0.0.0.0:6155 (HTTP/1.1) -> Forwarding to Upstream (H2C)");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We verify that the proxy accepts HTTP/1.1 but receives a response from the H2C-only upstream port.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 15_h2c_support
+```
+
+### 2. Test with Curl
+
+We use a standard `curl` command (which defaults to HTTP/1.1).
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6155
+```
+
+### 3. Result Analysis
+
+* **Client Side**: `HTTP/1.1 200 OK`. The client (curl) spoke HTTP/1.1 to the proxy.
+* **Proxy Logs**: `Forwarding to Upstream Advanced via H2C`.
+* **Body**: `Response from Advanced Upstream (H2C - Cleartext HTTP/2)`. This specific body text confirms that we successfully hit the Nginx server block listening on port 8081.
