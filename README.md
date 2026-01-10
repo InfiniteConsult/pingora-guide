@@ -235,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Verification
 
-To verify that your raw TCP server is working correctly, we will use `telnet` (since `nc` is unavailable).
+To verify that your raw TCP server is working correctly, we will use `telnet`.
 
 1. **Run the Server**:
    Open your terminal in the project root and run the example. We enable info logs to see the connection events.
@@ -970,7 +970,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Verification
 
-We will verify that both services are running and successfully communicating via the shared state. Since `nc` (Netcat) is useful for testing network services, you may need to install it if you haven't already:
+We will verify that both services are running and successfully communicating via the shared state. Since `nc` (Netcat) is useful for testing network services, you may need to install it if you haven't already and are operating outside the dev container:
 
 ```bash
 sudo apt install netcat-traditional
@@ -2698,3 +2698,143 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6162
    INFO  Forwarding to UDS: /tmp/upstream.sock
    ```
 * **Response**: `200 OK` with body `Hello via UDS`.
+
+# Lesson 19: Peer Options
+
+In a complex microservices architecture, not all upstreams are created equal. A real-time bidding server might need to fail fast (e.g., 50ms), while a legacy reporting service might need a generous 30-second window.
+
+Pingora allows granular control over connection parameters via the `peer.options` struct. This allows you to apply different Service Level Agreements (SLAs) dynamically per request.
+
+## Key Concepts
+
+* **`connection_timeout`**: The maximum time allowed to establish the TCP (and TLS) handshake.
+* **`read_timeout`**: The maximum time allowed between bytes when reading the response body.
+* **The "Blackhole" Pattern**: To test connection timeouts reliably in a local lab, we route traffic to `192.0.2.1`. This is a reserved "TEST-NET" IP address that is guaranteed not to route, causing the connection attempt to hang until the timeout fires.
+* **`fail_to_proxy`**: Timeouts in Pingora generate specific error types (`ConnectTimedout`, `ReadTimedout`). We catch these here to return a specific `504 Gateway Timeout` status instead of a generic 502.
+
+## The Code (`examples/19_peer_options.rs`)
+
+We configure the proxy to switch behaviors based on the URL path:
+
+1. **`/normal`**: Connects to the standard upstream with a 2-second timeout.
+2. **`/timeout`**: Attempts to connect to the "Blackhole" IP with a **100ms** timeout. This guarantees a `ConnectTimedout` error.
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use std::time::Duration;
+use pingora::proxy::FailToProxy;
+
+pub struct TimeoutProxy;
+
+#[async_trait]
+impl ProxyHttp for TimeoutProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        let path = session.req_header().uri.path();
+
+        // 1. Determine Target based on path
+        let (addr, sni, timeout) = if path == "/timeout" {
+            // Case A: The "Blackhole"
+            // 192.0.2.1 is a reserved Test-Net IP. It will not respond.
+            // We set a 100ms timeout to fail fast.
+            info!("Routing to Blackhole IP (192.0.2.1) to force timeout...");
+            (("192.0.2.1", 80), "blackhole.local", Duration::from_millis(100))
+        } else {
+            // Case B: The Happy Path
+            info!("Routing to Blue (Standard Timeout)");
+            (("172.28.0.20", 8080), "blue.pingora.local", Duration::from_secs(2))
+        };
+
+        let mut peer = Box::new(HttpPeer::new(addr, false, sni.to_string()));
+
+        // 2. Apply the specific timeout config
+        peer.options.connection_timeout = Some(timeout);
+        // We set generous read/write timeouts to ensure only connection time is tested
+        peer.options.read_timeout = Some(Duration::from_secs(2)); 
+        peer.options.write_timeout = Some(Duration::from_secs(2));
+
+        Ok(peer)
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX
+    ) -> FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        // 3. Handle the Timeout Error
+        match e.etype {
+            ErrorType::ConnectTimedout | ErrorType::ReadTimedout => {
+                warn!("Custom Error Handler: Connection Timed Out!");
+                let _ = session.respond_error(504).await;
+                return FailToProxy {
+                    error_code: 504,
+                    can_reuse_downstream: false,
+                };
+            }
+            _ => {
+                // Fallback for other errors
+                warn!("Fail to proxy: {:?}", e);
+                let _ = session.respond_error(502).await;
+                FailToProxy{
+                    error_code: 502,
+                    can_reuse_downstream: false,
+                }
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, TimeoutProxy);
+    my_proxy.add_tcp("0.0.0.0:6163");
+
+    info!("Timeout Config Proxy running on 0.0.0.0:6163");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+**1. Start the Proxy**
+
+```bash
+RUST_LOG=info cargo run --example 19_peer_options
+```
+
+**2. Test Normal Request**
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6163/normal
+```
+
+*Result:* `200 OK` from Blue.
+
+**3. Test Timeout Request**
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6163/timeout
+```
+
+*Result:* After exactly 100ms, you will receive `504 Gateway Timeout`.
+*Logs:* `Routing to Blackhole IP...` followed by `Custom Error Handler: Connection Timed Out!`.
