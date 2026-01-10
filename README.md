@@ -2,7 +2,7 @@
 
 To ensure a consistent environment for these tutorials, we have created a deterministic network topology using Docker Compose. This "Pingora City" simulates a real-world infrastructure with multiple clients, distinct upstreams (HTTP, HTTPS, gRPC, H2C), and a dedicated development station.
 
-### 1. Setup & Installation
+## 1. Setup & Installation
 
 **Prerequisites:** Docker and Docker Compose.
 
@@ -18,7 +18,7 @@ docker compose up -d --build
 
 ```
 
-### 2. The Developer Environment
+## 2. The Developer Environment
 
 You do not need Rust installed on your host machine. We have a dedicated `dev` container (Debian Bookworm) with a pre-configured Rust toolchain, OpenSSL, and network utilities.
 
@@ -53,7 +53,7 @@ We have provided a script to verify that the Dev station can reach all upstream 
 
 Type `exit` to return to your host terminal.
 
-### 3. Verification & Connectivity Test
+## 3. Verification & Connectivity Test
 
 From your **host machine**, run the `validate-others.sh` script. This automation script will:
 
@@ -70,7 +70,7 @@ chmod +x scripts/validate-others.sh
 
 ```
 
-### 4. Network Topology & Services
+## 4. Network Topology & Services
 
 The lab runs on a fixed subnet `172.28.0.0/24`. All containers mount the `conf/keys` directory to trust the local Root CA.
 
@@ -93,14 +93,14 @@ Pingora is not just an HTTP proxy; it is a generic network server framework. At 
 
 We will build a raw TCP Echo Server. This requires implementing the `ServerApp` trait, which gives us direct access to the underlying TCP stream before any protocol parsing occurs.
 
-### Key Concepts
+## Key Concepts
 
 1. **`Server`**: The process manager. It owns the main thread, handles signals (like SIGTERM), and manages the worker threads.
 2. **`Service`**: A background worker or a listening endpoint. A `Server` can run multiple `Services`.
 3. **`ServerApp`**: The logic trait. You implement this to define *what* happens when a new connection is established.
 4. **`Stream`**: A wrapper around the raw socket (TCP or Unix Domain Socket). It implements `AsyncRead` and `AsyncWrite`.
 
-### The Code (`examples/00_basic_server.rs`)
+## The Code (`examples/00_basic_server.rs`)
 
 We will implement a struct `EchoApp`. When a client connects, `EchoApp` will read bytes from the stream and immediately write them back until the client disconnects or the server shuts down.
 
@@ -233,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Verification
+## Verification
 
 To verify that your raw TCP server is working correctly, we will use `telnet` (since `nc` is unavailable).
 
@@ -272,7 +272,7 @@ In Lesson 0, we built a server that ran with default settings. However, producti
 
 Pingora handles this "infrastructure" configuration separately from your traffic handling logic. This separation allows the framework to manage the process lifecycle (daemonization, restarts, upgrades) standardly across all Pingora applications.
 
-### Key Concepts
+## Key Concepts
 
 1. **`Opt`**: This struct represents command-line arguments. Pingora provides a standard parser (via `clap`) that handles flags like `-c` (config file), `-d` (daemon mode), and `-u` (upgrade).
 2. **`ServerConf`**: This struct holds the runtime configuration for the server process. It includes settings for:
@@ -282,7 +282,7 @@ Pingora handles this "infrastructure" configuration separately from your traffic
    * **SSL/Network**: `ca_file`, `upstream_keepalive_pool_size`.
 3. **`Server::new`**: This constructor is the bridge. It takes the command-line options (`Opt`), attempts to load the configuration file specified by `-c`, merges it with defaults, and returns a fully initialized `Server` instance.
 
-### The Code (`examples/01_configuration.rs`)
+## The Code (`examples/01_configuration.rs`)
 
 In this example, we build a "dummy" server. Its only purpose is to load a configuration file and print the resulting settings to the console so we can verify that Pingora is correctly parsing our input.
 
@@ -365,9 +365,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```
 
-### Running the Lesson
+## Running the Lesson
 
-#### 1. Define a Configuration File
+### 1. Define a Configuration File
 
 Create a file at `conf/01_config.yaml` with the following content. We specifically set `threads` to 2 to differentiate it from the default (which is usually 1 or the number of cores depending on environment).
 
@@ -381,7 +381,7 @@ error_log: "/tmp/pingora_error.log"
 
 ```
 
-#### 2. Run with Defaults
+### 2. Run with Defaults
 
 First, run without arguments. Pingora will use its internal defaults.
 
@@ -392,7 +392,7 @@ RUST_LOG=info cargo run --example 01_configuration
 
 You should see `threads: 1` and `pid_file: /tmp/pingora.pid`.
 
-#### 3. Run with Configuration
+### 3. Run with Configuration
 
 Now, pass the configuration file.
 
@@ -417,7 +417,7 @@ Pingora has built-in support for daemonization. It handles the low-level Unix op
 
 This lesson also introduces the **`BackgroundService`**. Unlike the `ListeningService` from Lesson 0 (which accepts network connections), a `BackgroundService` runs an arbitrary task loop. This is useful for sidecar processes, metric exporters, or health check runners that need to live alongside your proxy logic.
 
-### Key Concepts
+## Key Concepts
 
 1. **Daemonization Configuration**:
    * **`daemon: true`**: Tells Pingora to fork into the background.
@@ -426,7 +426,7 @@ This lesson also introduces the **`BackgroundService`**. Unlike the `ListeningSe
 2. **`BackgroundService`**: A trait for tasks that run continuously until the server shuts down. It receives a `ShutdownWatch` to know when to exit gracefully.
 3. **`background_service` Helper**: A utility function in the prelude that wraps your custom logic into a generic service container, saving you from implementing boilerplate.
 
-### The Code (`examples/02_daemon_mode.rs`)
+## The Code (`examples/02_daemon_mode.rs`)
 
 This example defines a `HeartbeatService` that logs a message every second. We check the `shutdown` signal in the loop to ensure we stop immediately when the server receives a `SIGTERM`.
 
@@ -489,11 +489,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```
 
-### Running the Lesson
+## Running the Lesson
 
 To test daemonization, we must use a configuration file, as the behavior changes significantly from the default foreground mode.
 
-#### 1. Define the Daemon Configuration
+### 1. Define the Daemon Configuration
 
 Create `conf/02_daemon.yaml`. We set `daemon: true` and define paths for logs and the PID file.
 
@@ -507,7 +507,7 @@ upgrade_sock: "/tmp/pingora_upgrade_02.sock"
 
 ```
 
-#### 2. Start the Daemon
+### 2. Start the Daemon
 
 Run the server with the configuration.
 
@@ -518,7 +518,7 @@ RUST_LOG=info cargo run --example 02_daemon_mode -- -c conf/02_daemon.yaml
 
 The program will print "Preparing to daemonize..." and then **exit immediately**. This is expected; the parent process exits while the child process continues in the background.
 
-#### 3. Verify Background Execution
+### 3. Verify Background Execution
 
 The server is now running silently. You can verify this by checking the PID file or listing processes.
 
@@ -531,7 +531,7 @@ ps -p $(cat /tmp/pingora_02.pid)
 
 ```
 
-#### 4. Check the Logs
+### 4. Check the Logs
 
 Since the process is detached, you won't see "Beep..." in your terminal. Tail the log file to see the output.
 
@@ -542,7 +542,7 @@ tail -f /tmp/pingora_02.log
 
 You should see the heartbeat messages appearing every second.
 
-#### 5. Stop the Daemon
+### 5. Stop the Daemon
 
 To stop the server gracefully, send a `SIGTERM` to the process ID stored in the PID file.
 
@@ -564,7 +564,7 @@ Pingora provides a built-in **Graceful Shutdown** mechanism to handle this. When
 3. It waits for a configurable period (the `grace_period_seconds`) for services to finish their current work.
 4. If the grace period expires and services are still running, it forces a shutdown.
 
-### Key Concepts
+## Key Concepts
 
 * **`ShutdownWatch`**: This is a Tokio `watch` channel provided to every service's `start()` method. Services must monitor this to know when to stop accepting new work and begin their cleanup.
 * **`grace_period_seconds`**: A setting in `ServerConf`. It defines the maximum time the server will wait for services to finish after a shutdown signal is received.
@@ -572,9 +572,7 @@ Pingora provides a built-in **Graceful Shutdown** mechanism to handle this. When
 * **Fast Shutdown (`SIGINT` / Ctrl+C)**: The server exits immediately. Use this during development or emergencies.
 * **Graceful Shutdown (`SIGTERM`)**: The server enters the graceful shutdown phase described above. This is the standard signal used by deployment tools like Kubernetes or systemd.
 
-
-
-### The Code (`examples/03_graceful_shutdown.rs`)
+## The Code (`examples/03_graceful_shutdown.rs`)
 
 We will build a "Batch Job" service. It simulates processing long-running tasks that take 20 seconds to complete.
 
@@ -668,11 +666,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```
 
-### Running the Lesson
+## Running the Lesson
 
 To verify this lesson, we need to send specific signals to the process. We will test both the graceful path and the fast path.
 
-#### 1. Test Graceful Shutdown (The Happy Path)
+### 1. Test Graceful Shutdown (The Happy Path)
 
 We want to confirm that if we stop the server while a job is running, it finishes that job.
 
@@ -693,7 +691,7 @@ We want to confirm that if we stop the server while a job is running, it finishe
    * Our service logs `Shutdown signal received... Finishing Job #1`.
    * **Crucially**, the server *waits* for the job to finish (`Job #1 completed gracefully`) before the process actually exits.
 
-#### 2. Test Fast Shutdown (The Emergency Path)
+### 2. Test Fast Shutdown (The Emergency Path)
 
 We want to confirm that we can still force-kill the server if needed.
 
@@ -710,7 +708,7 @@ We want to confirm that we can still force-kill the server if needed.
 
 Pingora offers two distinct threading models (runtimes) to execute your services. Choosing the right one is critical for performance tuning, as it dictates how your CPU cores are utilized and how tasks are scheduled.
 
-### The Two Flavors
+## The Two Flavors
 
 1. **Work Stealing (`Steal`)**:
    * **What it is:** This is the standard Tokio multi-threaded runtime behavior. All worker threads share a global queue of tasks. If one thread finishes its work early, it "steals" tasks from other busy threads.
@@ -723,7 +721,7 @@ Pingora offers two distinct threading models (runtimes) to execute your services
    * **Cons:** Susceptible to "head-of-line blocking." If Thread A gets a heavy CPU-bound job, it cannot offload pending tasks to Thread B, even if Thread B is idle.
    * **Use Case:** High-throughput proxies where request latency is uniform (IO-bound).
 
-### The Code (`examples/04_threading_model.rs`)
+## The Code (`examples/04_threading_model.rs`)
 
 In this lesson, we programmatically toggle the threading model to `NoSteal` (disabling work stealing) and set the thread count to 2.
 
@@ -805,7 +803,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```
 
-### Verification
+## Verification
 
 Run the server and observe the logs. You are looking for proof that two different Operating System threads are active.
 
@@ -836,13 +834,13 @@ In this lesson, we build a **Traffic Monitor**. It consists of two parts running
 1. **Traffic Service**: Accepts TCP connections and increments a shared counter.
 2. **Metric Exporter**: A background service that wakes up every 2 seconds to read and log the current connection count.
 
-### Key Concepts
+## Key Concepts
 
-#### 1. Shared State with `Arc`
+### 1. Shared State with `Arc`
 
 To share data between the Traffic Service (which writes) and the Exporter (which reads), we wrap our state struct in an `Arc` (Atomic Reference Counted smart pointer). This allows multiple threads to own a reference to the same memory location safely.
 
-#### 2. Atomic Operations & Memory Ordering
+### 2. Atomic Operations & Memory Ordering
 
 Since multiple threads access the `connection_count` simultaneously, we cannot use a simple `usize`. We must use `AtomicUsize`.
 
@@ -854,11 +852,11 @@ When reading or writing atomic variables, we must specify a **Memory Ordering**.
   * *Why avoid it here?* It forces heavy synchronization barriers on the CPU, slowing down performance unnecessarily for a simple counter.
 * **`Ordering::Acquire` / `Release**`: Used for locks. "If I see this flag set (Acquire), I am guaranteed to see all the data you wrote before you set the flag (Release)."
 
-#### 3. `BackgroundService` Lifecycle
+### 3. `BackgroundService` Lifecycle
 
 A background service receives a `ShutdownWatch` in its `start()` method. It is critical to check this watcher (usually via `tokio::select!`). If you ignore it, your background loop will keep running forever, preventing the server from shutting down gracefully.
 
-### The Code (`examples/05_background_services.rs`)
+## The Code (`examples/05_background_services.rs`)
 
 We define a shared `AppState` and pass clones of it to both services. The `Traffic` service simulates handling requests by incrementing the counter and writing a response. The `MetricExporter` wakes up periodically to read that counter.
 
@@ -970,7 +968,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Verification
+## Verification
 
 We will verify that both services are running and successfully communicating via the shared state. Since `nc` (Netcat) is useful for testing network services, you may need to install it if you haven't already:
 
@@ -1016,9 +1014,6 @@ Use `pkill -TERM -f 05_background_services` (or `Ctrl+C` if you don't mind the f
 ```bash
 pkill -TERM -f 05_background_services
 ```
-
-
-
 
 # Module 2: The Proxy Logic
 
@@ -1278,14 +1273,14 @@ One of the most common tasks for an API Gateway is to modify traffic as it passe
 
 Pingora provides specific hooks in the `ProxyHttp` trait to inspect and mutate headers at different stages of the request lifecycle.
 
-### Key Concepts
+## Key Concepts
 
 1. **`upstream_request_filter`**: This hook runs *after* the upstream peer has been selected but *before* the request is sent to the backend. It allows you to modify the `RequestHeader`.
    * *Use cases:* Adding authentication tokens, removing client-identifying info (scrubbing), or rewriting the `Host` header.
 2. **`response_filter`**: This hook runs *after* the response receives the headers from the backend but *before* the body is streamed to the client. It allows you to modify the `ResponseHeader`.
    * *Use cases:* Hiding backend server versions (`Server: nginx/1.18`), adding custom watermarks, or fixing caching headers.
 
-### The Code (`examples/08_header_manipulation.rs`)
+## The Code (`examples/08_header_manipulation.rs`)
 
 In this lesson, we proxy traffic to **Upstream Green** (172.28.0.21). We perform the following manipulations:
 
@@ -1380,7 +1375,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Verification
+## Verification
 
 To verify that the headers are being modified, we inspect the traffic from the client side.
 
@@ -1415,7 +1410,7 @@ This lesson introduces two critical architectural concepts in Pingora:
 1. **The Request Filter**: A hook that runs *early* in the lifecycle to validate requests or make routing decisions.
 2. **The Context (`CTX`)**: A mechanism to share state between different phases of a request (e.g., passing the routing decision from the "Filter" phase to the "Peer Selection" phase).
 
-### Key Concepts
+## Key Concepts
 
 1. **`request_filter`**: This hook runs immediately after the proxy receives the request headers from the client. It returns a `Result<bool>`.
    * If it returns `Ok(false)`: Pingora continues to the next phase (upstream peer selection).
@@ -1424,7 +1419,7 @@ This lesson introduces two critical architectural concepts in Pingora:
    * In simple proxies, this is `()`.
    * In routing proxies, we use it to store decisions (like `Option<Target>`) so subsequent hooks (like `upstream_peer` or `upstream_request_filter`) know what to do.
 
-### The Code (`examples/09_path_routing.rs`)
+## The Code (`examples/09_path_routing.rs`)
 
 We define a simple `Target` enum to represent our microservices.
 
@@ -1540,7 +1535,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Verification
+## Verification
 
 We verified this routing logic by sending requests to different paths and observing the responses.
 
@@ -1564,3 +1559,129 @@ We verified this routing logic by sending requests to different paths and observ
    docker exec -it pingora_client_1 curl -v http://172.28.0.10:6149/invalid
    ```
    *Result:* `404 Not Found` (Pingora Default Error Page).
+
+# Lesson 10: Query Params
+
+Modifying the request URI—specifically the query string—is a frequent requirement for edge proxies. Common use cases include:
+
+1. **Cache Normalization**: Reordering parameters or removing volatile ones (like `utm_source` or `fbclid`) so that requests map to the same cache key.
+2. **Security**: Stripping internal debug flags or administrative parameters before they reach the backend.
+3. **Analytics Tagging**: Injecting a source identifier (e.g., `ref=gateway`) so the upstream knows the request passed through the proxy.
+
+## Key Concepts
+
+* **`upstream_request.uri`**: Accessing the URI within the `upstream_request_filter` hook allows us to inspect the path and query string.
+* **URI Immutability**: The `http::Uri` type is immutable. To modify it, we typically extract the string components, manipulate them, parse a new `Uri` object, and then use `upstream_request.set_uri()`.
+* **Robust Parsing**: In production code, it is recommended to use the `url` crate for complex parsing (decoding percent-encoding, handling edge cases). For simple string replacement, standard string manipulation works fine.
+
+## The Code (`examples/10_query_params.rs`)
+
+In this lesson, we manipulate the URI string directly in `upstream_request_filter`. We perform two actions:
+
+1. **Security**: Remove any parameter starting with `debug=` (e.g., preventing `debug=true` from triggering verbose backend logs).
+2. **Tagging**: Append `ref=pingora` to every request.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use http::uri::Uri;
+
+pub struct QueryModeProxy;
+
+#[async_trait]
+impl ProxyHttp for QueryModeProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let peer = Box::new(HttpPeer::new(
+            ("172.28.0.20", 8080),
+            false,
+            "blue.pingora.local".to_string(),
+        ));
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self, _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // 1. Access the URI parts
+        let uri = &upstream_request.uri;
+        let path = uri.path();
+        let query = uri.query().unwrap_or("");
+
+        info!("Original Query: '{}'", query);
+
+        // 2. Manipulate the Query String
+        // We filter OUT "debug=..." and append "ref=pingora"
+        let mut params: Vec<&str> = query.split("&")
+            .filter(|part| !part.is_empty() && !part.starts_with("debug="))
+            .collect();
+        
+        params.push("ref=pingora");
+        let new_query = params.join("&");
+
+        // 3. Construct and parse the new URI
+        let new_uri_string = format!("{}?{}", path, new_query);
+        let new_uri: Uri = new_uri_string.parse().expect("Failed to parse new URI");
+
+        info!("Rewritten URI: {}", new_uri);
+
+        // 4. Update the request
+        upstream_request.set_uri(new_uri);
+        upstream_request.insert_header("Host", "blue.pingora.local")?;
+
+        Ok(())
+    }
+}
+
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, QueryModeProxy);
+    my_proxy.add_tcp("0.0.0.0:6150");
+
+    info!("Query Param Proxy running on 0.0.0.0:6150");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+### Verification
+
+We will verify this by sending a request containing the forbidden `debug` parameter and observing the logs to confirm it was removed and replaced.
+
+1. **Start the Proxy (in `pingora_dev`)**:
+   ```bash
+   RUST_LOG=info cargo run --example 10_query_params
+   ```
+   *Output:* `Query Param Proxy running on 0.0.0.0:6150`
+2. **Send a Request (from Host)**:
+   We construct a URL with a mix of parameters:
+   ```bash
+   docker exec -it pingora_client_1 curl -v "http://172.28.0.10:6150/search?q=rust&debug=true&sort=asc"
+   ```
+3. **Result Analysis**:
+   * **Proxy Logs**: You should see the transformation happening. The `debug=true` segment is dropped, and `ref=pingora` is appended.
+   ```text
+   INFO  Original Query: 'q=rust&debug=true&sort=asc'
+   INFO  Rewritten URI: /search?q=rust&sort=asc&ref=pingora
+   ```
+   * **Upstream Behavior**: If you inspect the `blue` container logs (or if the echo server reflected the query string), you would see it received the sanitized version.
