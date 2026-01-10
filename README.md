@@ -1285,8 +1285,6 @@ Pingora provides specific hooks in the `ProxyHttp` trait to inspect and mutate h
 2. **`response_filter`**: This hook runs *after* the response receives the headers from the backend but *before* the body is streamed to the client. It allows you to modify the `ResponseHeader`.
    * *Use cases:* Hiding backend server versions (`Server: nginx/1.18`), adding custom watermarks, or fixing caching headers.
 
-
-
 ### The Code (`examples/08_header_manipulation.rs`)
 
 In this lesson, we proxy traffic to **Upstream Green** (172.28.0.21). We perform the following manipulations:
@@ -1407,3 +1405,162 @@ To verify that the headers are being modified, we inspect the traffic from the c
    INFO  Request headers modified: Added X-Pingora-Proxy, Removed User-Agent.
    INFO  Response headers modified: Added X-Edited-By
    ```
+
+# Lesson 9: Path Routing
+
+In previous lessons, we blindly forwarded every request to a single destination. In reality, proxies act as traffic routers, dispatching requests to different microservices based on the URL path, HTTP method, or headers.
+
+This lesson introduces two critical architectural concepts in Pingora:
+
+1. **The Request Filter**: A hook that runs *early* in the lifecycle to validate requests or make routing decisions.
+2. **The Context (`CTX`)**: A mechanism to share state between different phases of a request (e.g., passing the routing decision from the "Filter" phase to the "Peer Selection" phase).
+
+### Key Concepts
+
+1. **`request_filter`**: This hook runs immediately after the proxy receives the request headers from the client. It returns a `Result<bool>`.
+   * If it returns `Ok(false)`: Pingora continues to the next phase (upstream peer selection).
+   * If it returns `Ok(true)`: Pingora assumes the request has been fully handled (e.g., you sent a 404 error response manually) and stops processing.
+2. **Context (`CTX`)**: The `ProxyHttp` trait has an associated type `CTX`. This is your custom state object created via `new_ctx()` for every new request.
+   * In simple proxies, this is `()`.
+   * In routing proxies, we use it to store decisions (like `Option<Target>`) so subsequent hooks (like `upstream_peer` or `upstream_request_filter`) know what to do.
+
+### The Code (`examples/09_path_routing.rs`)
+
+We define a simple `Target` enum to represent our microservices.
+
+* **`/blue`** -> Routes to Upstream Blue.
+* **`/green`** -> Routes to Upstream Green.
+* **Other** -> Returns a 404 error immediately.
+
+```rust
+use async_trait::async_trait;
+use log::{error, info};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+
+// 1. Define an Enum to track our routing decision
+// This will be stored in the Request Context (CTX)
+#[derive(Debug, Clone, Copy)]
+pub enum Target {
+    Blue,
+    Green,
+}
+
+pub struct PathRouter;
+
+#[async_trait]
+impl ProxyHttp for PathRouter {
+    // 2. Define the Context Type
+    // Instead of (), we now use Option<Target> to store our decision.
+    type CTX = Option<Target>;
+
+    fn new_ctx(&self) -> Self::CTX {
+        None
+    }
+
+    // 3. Request Filter: The Gatekeeper
+    // We check the path *before* picking a peer.
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX
+    ) -> pingora::Result<bool> {
+        let path = session.req_header().uri.path();
+
+        if path.starts_with("/blue") {
+            *ctx = Some(Target::Blue);
+        } else if path.starts_with("/green") {
+            *ctx = Some(Target::Green);
+        } else {
+            // Unknown path: Return 404 immediately
+            let _ = session.respond_error(404).await;
+            // Return true to tell Pingora "we handled this, stop processing".
+            return Ok(true)
+        }
+        
+        // Return false to continue to the next phase (upstream_peer)
+        Ok(false)
+    }
+
+    // 4. Upstream Peer: The Router
+    // We read the decision made in request_filter to pick the IP.
+    async fn upstream_peer(
+        &self, session: &mut Session,
+        ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let target = ctx.expect("Context should be set by request_filter");
+
+        let (addr, sni) = match target {
+            Target::Blue => (("172.28.0.20", 8080), "blue.pingora.local"),
+            Target::Green => (("172.28.0.21", 8080), "green.pingora.local"),
+        };
+
+        info!("Routing request to {:?} based on path", target);
+        let peer = Box::new(HttpPeer::new(addr, false, sni.to_string()));
+        Ok(peer)
+    }
+
+    // 5. Upstream Request Filter: The Modifier
+    // We rewrite the Host header to match the chosen upstream.
+    async fn upstream_request_filter(
+        &self, _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let target = ctx.expect("Context should be set");
+        let host = match target {
+            Target::Blue => "blue.pingora.local",
+            Target::Green => "green.pingora.local",
+        };
+
+        upstream_request.insert_header("Host", host)?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, PathRouter);
+    my_proxy.add_tcp("0.0.0.0:6149");
+
+    info!("Path Router running on 0.0.0.0:6149");
+    info!("Try: curl http://127.0.0.1:6149/blue or /green");
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+### Verification
+
+We verified this routing logic by sending requests to different paths and observing the responses.
+
+1. **Start the Proxy (in `pingora_dev`)**:
+   ```bash
+   RUST_LOG=info cargo run --example 09_path_routing
+   ```
+   *Output:* `Path Router running on 0.0.0.0:6149`
+2. **Test Blue Route**:
+   ```bash
+   docker exec -it pingora_client_1 curl -v http://172.28.0.10:6149/blue
+   ```
+   *Result:* `200 OK` and `'Response from BLUE'`.
+3. **Test Green Route**:
+   ```bash
+   docker exec -it pingora_client_1 curl -v http://172.28.0.10:6149/green
+   ```
+   *Result:* `200 OK` and `'Response from GREEN'`.
+4. **Test Invalid Route (404)**:
+   ```bash
+   docker exec -it pingora_client_1 curl -v http://172.28.0.10:6149/invalid
+   ```
+   *Result:* `404 Not Found` (Pingora Default Error Page).
