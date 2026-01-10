@@ -1799,3 +1799,149 @@ We verified the logic by inspecting the HTTP headers using `curl`.
    * **Removed**: The output showed `< X-App-Name: http-echo`, but `X-App-Version` was successfully absent (it is normally present in the echo server response).
    * **Added**: The line `< X-Content-Type-Options: nosniff` appeared.
    * **Copied**: The line `< X-Legacy-Date: ...` appeared with the exact timestamp as the standard `Date` header.
+
+# Lesson 12: Body Inspection
+
+Validating the request *body* is a powerful capability for an edge proxy. While standard Load Balancers often just route based on headers, a sophisticated proxy can act as a **WAF** (Web Application Firewall), inspecting payloads for SQL injection, malware signatures, or prohibited keywords.
+
+However, inspecting bodies in a proxy is challenging because proxies are typically **streaming** by default to maintain high performance and low memory usage. To inspect the body, we often need to buffer it (hold it in memory), which creates trade-offs between security and resource consumption.
+
+## Key Concepts
+
+* **`request_body_filter`**: This hook is called iteratively for every chunk of data the client uploads. It provides a `&mut Option<Bytes>`, which allows you to inspect, modify, or reject the chunk before it is passed to the upstream.
+* **Streaming vs. Buffering**:
+* **Streaming**: Data flows `Client -> Proxy -> Upstream` immediately. Good for speed, bad for inspection (you might send half a malicious payload before detecting it).
+* **Buffering**: Data is held in the Proxy's `CTX` until a condition is met. In this lesson, we buffer chunks into a `Vec<u8>` to perform a string check.
+* **Safety**: When inspecting bodies, you **must** enforce size limits (e.g., stopping after 1MB). Otherwise, a client could exhaust your proxy's RAM by sending an infinite stream of data.
+
+## The Code (`examples/12_body_inspection.rs`)
+
+We define a `BodyCtx` struct to hold our inspection buffer. We then implement `request_body_filter` to accumulate incoming bytes and scan for the forbidden keyword `"rogue"`. If detected, we return a custom error, which immediately aborts the connection.
+
+```rust
+use async_trait::async_trait;
+use bytes::Bytes;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+
+pub struct BodyInspector;
+
+// 1. Define the Context
+// We use a simple buffer (Vec<u8>) to accumulate the body for inspection.
+pub struct BodyCtx {
+    buffer: Vec<u8>,
+}
+
+#[async_trait]
+impl ProxyHttp for BodyInspector {
+    type CTX = BodyCtx;
+
+    // Initialize the empty buffer for each request
+    fn new_ctx(&self) -> Self::CTX {
+        BodyCtx { buffer: Vec::new() }
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let peer = Box::new(HttpPeer::new(
+            ("172.28.0.20", 8080),
+            false,
+            "blue.pingora.local".to_string(),
+        ));
+        Ok(peer)
+    }
+
+    // 2. Request Body Filter
+    // This runs for EVERY chunk of the request body.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // If there is data in this chunk...
+        if let Some(bytes) = body {
+            // ...append it to our inspection buffer.
+            // Note: In production, enforce a size limit (e.g. 1MB) to prevent memory DoS.
+            ctx.buffer.extend_from_slice(bytes);
+
+            // Check for the forbidden pattern
+            // We use String::from_utf8_lossy to handle potential binary data safely.
+            let content = String::from_utf8_lossy(&ctx.buffer);
+            
+            if content.contains("rogue") {
+                warn!("Security Alert: Forbidden content 'rogue' detected in body!");
+                // Returning an error here immediately aborts the proxy session.
+                return Err(pingora::Error::new(ErrorType::Custom("SecurityPolicyViolation")));
+            }
+        }
+        
+        // If we didn't find the keyword, we allow the chunk to proceed.
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, BodyInspector);
+    my_proxy.add_tcp("0.0.0.0:6152");
+
+    info!("Body Inspector running on 0.0.0.0:6152");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+
+```
+
+## Verification
+
+To verify the "WAF" functionality, we send both compliant and non-compliant POST requests using `curl`.
+
+### 1. Start the Proxy
+
+Run the example inside the `pingora_dev` container:
+
+```bash
+RUST_LOG=info cargo run --example 12_body_inspection
+```
+
+### 2. Test Clean Request
+
+From the host machine, send a harmless payload:
+
+```bash
+docker exec -it pingora_client_1 curl -v -X POST -d "Hello World" http://172.28.0.10:6152
+```
+
+*Result:* `200 OK` with body `'Response from BLUE'`.
+
+### 3. Test Forbidden Request
+
+From the host machine, send a payload containing the trigger word:
+
+```bash
+docker exec -it pingora_client_1 curl -v -X POST -d "I am a rogue agent" http://172.28.0.10:6152
+```
+
+*Result:* `500 Internal Server Error` (or Connection Closed).
+
+*Proxy Logs:*
+
+```text
+WARN  Security Alert: Forbidden content 'rogue' detected in body!
+ERROR Fail to proxy: SecurityPolicyViolation ...
+```
