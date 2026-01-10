@@ -1664,7 +1664,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Verification
+## Verification
 
 We will verify this by sending a request containing the forbidden `debug` parameter and observing the logs to confirm it was removed and replaced.
 
@@ -1685,3 +1685,117 @@ We will verify this by sending a request containing the forbidden `debug` parame
    INFO  Rewritten URI: /search?q=rust&sort=asc&ref=pingora
    ```
    * **Upstream Behavior**: If you inspect the `blue` container logs (or if the echo server reflected the query string), you would see it received the sanitized version.
+
+# Lesson 11: Response Modification
+
+Just as we can modify requests before they reach the upstream, we can intercept and modify the response coming back from the backend before it reaches the client.
+
+This is critical for:
+
+1. **Security**: Adding headers like `HSTS`, `X-Frame-Options`, or `Content-Security-Policy` (CSP) centrally, rather than configuring them on every backend service.
+2. **Privacy**: Stripping headers that leak internal implementation details (e.g., removing `X-Powered-By` or internal version numbers).
+3. **Legacy Compatibility**: Renaming or duplicating headers to satisfy old client applications.
+
+## Key Concepts
+
+* **`response_filter`**: The `ProxyHttp` hook that runs after the upstream has responded with headers, but before the body is streamed.
+* **`ResponseHeader`**: The struct representing the response. It behaves similarly to `RequestHeader`, allowing you to `insert`, `remove`, or `get` headers.
+* **Header Handling**: Headers in HTTP are technically multi-valued. When using `.get()`, you receive the first value. If you need to handle multiple values (like multiple `Set-Cookie` headers), you would iterate over them, though simple insertion/removal is the most common use case.
+
+## The Code (`examples/11_response_modification.rs`)
+
+We configure the proxy to forward traffic to **Upstream Blue**. On the return trip, we perform three operations:
+
+1. **Strip** the `X-App-Version` header to hide the backend version.
+2. **Inject** `X-Content-Type-Options: nosniff` to prevent browsers from MIME-sniffing the response.
+3. **Duplicate** the `Date` header into `X-Legacy-Date` to simulate supporting a legacy client that expects this specific header name.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::http::ResponseHeader;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+
+pub struct ResponseModProxy;
+
+#[async_trait]
+impl ProxyHttp for ResponseModProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let peer = Box::new(HttpPeer::new(
+            ("172.28.0.20", 8080),
+            false,
+            "blue.pingora.local".to_string(),
+        ));
+        Ok(peer)
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // 1. Remove a header to hide backend details
+        let _ = upstream_response.remove_header("X-App-Version");
+
+        // 2. Add a security header
+        upstream_response.insert_header("X-Content-Type-Options", "nosniff")?;
+
+        // 3. Copy/Rename a header
+        // We retrieve the 'Date' header and insert it as 'X-Legacy-Date'.
+        if let Some(date_val) = upstream_response.headers.get("Date") {
+            // We clone the bytes because insert_header takes ownership
+            let val_bytes = date_val.as_bytes().to_vec();
+            upstream_response.insert_header("X-Legacy-Date", val_bytes)?;
+        }
+
+        info!("Response filtered. Stripped Version. Added Security Headers.");
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, ResponseModProxy);
+    my_proxy.add_tcp("0.0.0.0:6151");
+
+    info!("Response Mod Proxy running on 0.0.0.0:6151");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+
+```
+
+## Verification
+
+We verified the logic by inspecting the HTTP headers using `curl`.
+
+1. **Start the Proxy (in `pingora_dev`)**:
+   ```bash
+   RUST_LOG=info cargo run --example 11_response_modification
+   ```
+2. **Test from Client (from Host)**:
+   ```bash
+   docker exec -it pingora_client_1 curl -v http://172.28.0.10:6151
+   ```
+3. **Result Analysis**:
+   * **Removed**: The output showed `< X-App-Name: http-echo`, but `X-App-Version` was successfully absent (it is normally present in the echo server response).
+   * **Added**: The line `< X-Content-Type-Options: nosniff` appeared.
+   * **Copied**: The line `< X-Legacy-Date: ...` appeared with the exact timestamp as the standard `Date` header.
