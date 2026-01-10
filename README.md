@@ -2368,3 +2368,106 @@ In this module, we will explore the mechanics of connectivity. You will learn ho
 * **Secure Connections**: Manage TLS handshakes, SNI routing, and Mutual TLS (mTLS) authentication.
 * **Handle Advanced Protocols**: Tunnel traffic via `CONNECT`, upgrade connections for WebSockets, and proxy gRPC streams.
 * **Tune Performance**: optimize connection reuse (Keep-Alive) and configure granular timeouts to ensure resilience.
+
+
+
+
+
+
+# Lesson 16: Static Peer
+
+The simplest way to connect to an upstream service is by using a **Static Peer**. In this configuration, the IP address and port of the backend server are known ahead of time and do not change (or change very rarely).
+
+While modern cloud environments often rely on dynamic service discovery, static definitions are still widely used for:
+
+* Connecting to legacy infrastructure with fixed IPs.
+* Routing traffic to local sidecars (e.g., sending to `127.0.0.1:8080`).
+* Simple, high-performance setups where DNS overhead is undesirable.
+
+## Key Concepts
+
+* **`HttpPeer`**: This is the fundamental struct Pingora uses to represent a backend connection. It encapsulates three critical pieces of information:
+  1. **Address**: A `SocketAddr` (IP + Port).
+  2. **TLS Config**: A boolean flag (`true` for HTTPS, `false` for HTTP).
+  3. **SNI (Server Name Indication)**: The domain name associated with the backend.
+* **The Role of SNI**: Even when `use_tls` is false, providing a valid SNI string is important. Pingora often uses this string to populate the default `Host` header if the request doesn't explicitly provide one.
+
+## The Code (`examples/16_static_peer.rs`)
+
+We configure the proxy to route all traffic to **Upstream Blue** at the hardcoded address `172.28.0.20:8080`.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+
+pub struct StaticPeerProxy;
+
+#[async_trait]
+impl ProxyHttp for StaticPeerProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // 1. Define the Socket Address
+        // In a static setup, this is hardcoded or loaded from a config file.
+        // It accepts any type that implements ToSocketAddrs (e.g., tuple or string)
+        let addr = ("172.28.0.20", 8080);
+
+        // 2. Configure TLS
+        // false = Plaintext (HTTP)
+        let use_tls = false;
+
+        // 3. Define SNI
+        // Used for TLS handshake and Host header generation
+        let sni = "blue.pingora.local".to_string();
+
+        let peer = Box::new(HttpPeer::new(addr, use_tls, sni));
+
+        info!("Connecting to static peer: {:?}", addr);
+        Ok(peer)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, StaticPeerProxy);
+    my_proxy.add_tcp("0.0.0.0:6160");
+
+    info!("Static Peer Proxy running on 0.0.0.0:6160");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We verify that the proxy successfully connects to the specific static IP provided.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 16_static_peer
+```
+
+### 2. Test Connection
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6160
+```
+
+### 3. Result Analysis
+
+* **Response**: `200 OK` containing `'Response from BLUE'`.
+* **Logs**: You should see the log entry `Connecting to static peer: ("172.28.0.20", 8080)`. This confirms the `upstream_peer` hook executed and selected the correct hardcoded address.
