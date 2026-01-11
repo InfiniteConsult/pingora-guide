@@ -2984,3 +2984,146 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6164/v2/test
 *Log:* `Connecting to ... SNI: v2.api.pingora.local`
 
 This works seamlessly because we updated our certificate infrastructure to include `*.api.pingora.local` in the upstream certificate. Pingora successfully negotiates a secure TLS connection for both subdomains using the same backend IP.
+
+# Lesson 21: Mutual TLS (mTLS)
+
+Standard TLS (HTTPS) involves one-way authentication: the client validates the server's identity. **Mutual TLS (mTLS)** adds a second layer of security where the server also validates the client's identity. This is commonly used in Zero Trust architectures to ensure only authorized proxies or microservices can talk to sensitive backends.
+
+In this lesson, we will configure Pingora to present a **Client Certificate** when connecting to a secured upstream.
+
+## Key Concepts
+
+* **Client Certificate (`client.crt`)**: A digital identity card for the proxy. It is signed by a Root CA trusted by the upstream.
+* **Private Key (`client.key`)**: The secret key used to prove ownership of the certificate during the handshake.
+* **`CertKey` Struct**: Pingora's internal wrapper for an `X509` certificate chain and a `PKey` private key.
+* **`upstream_peer` Hook**: We attach the credentials to the `HttpPeer` struct dynamically. We can choose to send them for some requests (e.g., `/auth`) and omit them for others (e.g., `/anon`).
+* **Performance**: Parsing certificates from PEM files is CPU-intensive. We must load them into memory **once** during startup and wrap them in an `Arc` (Atomic Reference Counted) pointer to share them efficiently across thousands of requests.
+
+## The Code (`examples/21_mutual_tls.rs`)
+
+We create a proxy that connects to the **Advanced Upstream** on port `8443`, which enforces mTLS.
+
+* If the path is `/auth`, we attach the client certificate.
+* If the path is `/anon`, we attempt to connect without one.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::utils::tls::CertKey;
+use pingora::tls::x509::X509;
+use pingora::tls::pkey::PKey;
+use std::fs;
+use std::sync::Arc;
+
+// The struct holds the parsed Certificate/Key pair in an Arc.
+// This is thread-safe and cheap to clone for every request.
+pub struct MtlsProxy {
+    client_cert: Arc<CertKey>
+}
+
+#[async_trait]
+impl ProxyHttp for MtlsProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let path = session.req_header().uri.path();
+        
+        // Target the mTLS port (8443) on the Advanced Upstream
+        let addr = ("172.28.0.22", 8443);
+        let sni = "advanced.pingora.local";
+
+        let mut peer = Box::new(HttpPeer::new(addr, true, sni.to_string()));
+
+        // Decision Logic: To Auth or Not to Auth?
+        if path == "/auth" {
+            // Case 1: Authenticated
+            // We attach the Arc<CertKey>. Pingora will use this in the TLS handshake.
+            info!("Attaching Client Certificate for /auth request...");
+            peer.client_cert_key = Some(self.client_cert.clone());
+        } else {
+            // Case 2: Anonymous
+            // We explicitly leave client_cert_key as None.
+            info!("Connecting anonymously (no cert) for {}...", path);
+        }
+        Ok(peer)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 1. Load Credentials at Startup (Critical for Performance)
+    let cert_path = "/keys/client.crt";
+    let key_path = "/keys/client.key";
+
+    if !std::path::Path::new(cert_path).exists() {
+        return Err(format!("Client keys missing at {}. Run 00-setup-certs.sh", cert_path).into());
+    }
+
+    let cert_bytes = fs::read(cert_path)?;
+    let key_bytes = fs::read(key_path)?;
+
+    // 2. Parse PEM into OpenSSL Objects
+    let x509 = X509::from_pem(&cert_bytes[..])
+        .map_err(|e| format!("Failed to parse certificate: {}", e))?;
+    let key = PKey::private_key_from_pem(&key_bytes)
+        .map_err(|e| format!("Failed to parse private key: {}", e))?;
+
+    // 3. Wrap in CertKey and Arc
+    let cert_key = CertKey::new(vec![x509], key);
+    let client_cert = Arc::new(cert_key);
+
+    let my_proxy = MtlsProxy { client_cert };
+
+    let mut my_service = http_proxy_service(&my_server.configuration, my_proxy);
+    my_service.add_tcp("0.0.0.0:6165");
+
+    info!("mTLS Proxy running on 0.0.0.0:6165");
+    my_server.add_service(my_service);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify that the upstream server rejects anonymous connections but accepts authenticated ones.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 21_mutual_tls
+```
+
+### 2. Test Anonymous Access (Expected Failure)
+
+The upstream Nginx is configured with `ssl_verify_client on`. It should reject connections that lack a certificate.
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6165/anon
+```
+
+*Result:* `400 Bad Request`.
+*Body:* The HTML error page contains `<center>No required SSL certificate was sent</center>`.
+
+### 3. Test Authenticated Access (Expected Success)
+
+We hit the `/auth` path, causing Pingora to attach the client certificate.
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6165/auth
+```
+
+*Result:* `200 OK`.
+*Body:* `Response from mTLS Protected Upstream. Hello, Authenticated Client!`
