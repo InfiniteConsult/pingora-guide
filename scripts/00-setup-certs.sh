@@ -83,6 +83,7 @@ subjectAltName = @alt_names
 
 [alt_names]
 DNS.1 = advanced.pingora.local
+DNS.2 = *.api.pingora.local
 IP.1 = 172.28.0.22
 EOF
 
