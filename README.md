@@ -2838,3 +2838,149 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6163/timeout
 
 *Result:* After exactly 100ms, you will receive `504 Gateway Timeout`.
 *Logs:* `Routing to Blackhole IP...` followed by `Custom Error Handler: Connection Timed Out!`.
+
+# Lesson 20: SNI Routing
+
+In modern multi-tenant architectures (like CDNs or SaaS platforms), a single backend IP address often serves thousands of different domains. To route traffic correctly, the proxy must tell the upstream server *which* domain it is trying to reach during the TLS handshake. This is done via the **SNI (Server Name Indication)** extension.
+
+In this lesson, we will build a proxy that dynamically selects the SNI based on the request path.
+
+## Key Concepts
+
+* **SNI (Server Name Indication):** A TLS extension where the client (Pingora) sends the hostname it wants to connect to in the initial `ClientHello` packet. This allows the backend (Nginx) to select the correct certificate and server block.
+* **Context (`CTX`)**: We use the request context to store the decision made in `request_filter` (the routing logic) so it can be retrieved later in `upstream_peer` (where the TLS connection is created).
+* **Host Header vs. SNI**: While they often match, they are distinct. SNI is Layer 4 (TLS), while the Host header is Layer 7 (HTTP). To avoid confusion or rejection by the upstream, it is best practice to keep them in sync.
+* **Wildcard Certificates**: In our lab, the upstream Nginx server (`advanced.pingora.local`) holds a wildcard certificate for `*.api.pingora.local`. This allows it to accept connections for both `v1.api.pingora.local` and `v2.api.pingora.local` using the same certificate.
+
+## The Code (`examples/20_sni_routing.rs`)
+
+We map incoming paths to different subdomains:
+
+* `/v1/...` → `v1.api.pingora.local`
+* Other → `v2.api.pingora.local`
+
+We use the `SniCtx` struct to pass this decision from the filter phase to the peer selection phase.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+
+pub struct SniRouter;
+
+// 1. Define Context to share data between hooks
+pub struct SniCtx {
+    pub target_host: String,
+}
+
+#[async_trait]
+impl ProxyHttp for SniRouter {
+    type CTX = SniCtx;
+
+    // Initialize the context for each new request
+    fn new_ctx(&self) -> Self::CTX {
+        SniCtx {
+            target_host: String::new(),
+        }
+    }
+
+    // 2. Determine Routing Logic early (Layer 7 Filter)
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let path = session.req_header().uri.path();
+
+        // Calculate the target hostname based on path prefix
+        ctx.target_host = if path.starts_with("/v1") {
+            "v1.api.pingora.local".to_string()
+        } else {
+            "v2.api.pingora.local".to_string()
+        };
+
+        Ok(false)
+    }
+
+    // 3. Configure the Connection (Layer 4 Peer Selection)
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let addr = ("172.28.0.22", 443);
+        
+        // Retrieve the SNI we decided on earlier
+        let sni = ctx.target_host.clone();
+        
+        // Create the peer with TLS enabled (true)
+        // Because the upstream cert covers *.api.pingora.local, 
+        // both "v1" and "v2" SNIs will be accepted and validated.
+        let peer = Box::new(HttpPeer::new(addr, true, sni.clone()));
+        
+        info!("Connecting to IP: {:?} with SNI: {}", addr, sni);
+        Ok(peer)
+    }
+
+    // 4. Sync the Host Header (Layer 7 Request Modification)
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Ensure the Host header matches the SNI to satisfy the web server
+        upstream_request.insert_header("Host", &ctx.target_host)?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, SniRouter);
+    my_proxy.add_tcp("0.0.0.0:6164");
+
+    info!("SNI Routing Proxy running on 0.0.0.0:6164");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify that Pingora connects to the same upstream IP but presents different identities (SNI) depending on the URL.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 20_sni_routing
+```
+
+### 2. Test V1 Path
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6164/v1/test
+```
+
+*Result:* `200 OK`.
+*Log:* `Connecting to ... SNI: v1.api.pingora.local`
+
+### 3. Test V2 Path
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6164/v2/test
+```
+
+*Result:* `200 OK`.
+*Log:* `Connecting to ... SNI: v2.api.pingora.local`
+
+This works seamlessly because we updated our certificate infrastructure to include `*.api.pingora.local` in the upstream certificate. Pingora successfully negotiates a secure TLS connection for both subdomains using the same backend IP.
