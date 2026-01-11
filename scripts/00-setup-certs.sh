@@ -112,4 +112,41 @@ if [ ! -f "$KEYS_DIR/client.crt" ]; then
     rm "$KEYS_DIR/client.csr"
 fi
 
+# --- 5. gRPC Upstream Cert (For moul/grpcbin) ---
+# Used by the gRPC container to support TLS on port 9001.
+if [ ! -f "$KEYS_DIR/grpc.crt" ]; then
+    echo "--- Creating gRPC Certificates (grpc.pingora.local) ---"
+    openssl genrsa -out "$KEYS_DIR/grpc.key" 2048
+
+    cat > "$KEYS_DIR/grpc.conf" <<EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+req_extensions = req_ext
+
+[dn]
+C=US
+ST=PingoraCity
+O=gRPC Services
+CN=grpc.pingora.local
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = grpc.pingora.local
+IP.1 = 172.28.0.23
+EOF
+
+    openssl req -new -key "$KEYS_DIR/grpc.key" -out "$KEYS_DIR/grpc.csr" -config "$KEYS_DIR/grpc.conf"
+    openssl x509 -req -in "$KEYS_DIR/grpc.csr" \
+        -CA "$KEYS_DIR/ca.crt" -CAkey "$KEYS_DIR/ca.key" \
+        -CAcreateserial -out "$KEYS_DIR/grpc.crt" \
+        -days 365 -sha256 -extfile "$KEYS_DIR/grpc.conf" -extensions req_ext
+
+    rm "$KEYS_DIR/grpc.csr" "$KEYS_DIR/grpc.conf"
+fi
+
 echo "✅ All certificates generated in conf/keys/"

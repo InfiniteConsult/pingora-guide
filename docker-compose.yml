@@ -80,6 +80,9 @@ services:
     networks:
       pingora_net:
         ipv4_address: 172.28.0.23
+    volumes:
+      - ./conf/keys/grpc.crt:/root/cert/server.crt
+      - ./conf/keys/grpc.key:/root/cert/server.key
 
 networks:
   pingora_net:
