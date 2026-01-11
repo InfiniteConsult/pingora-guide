@@ -4659,3 +4659,178 @@ docker exec -it pingora_client_1 curl -v -b /cookies.txt http://172.28.0.10:6173
 ```
 
 * **Result:** Still routed to **Green**. The routing is now tied to the *User*, not the *URL*.
+
+# Lesson 30: TCP Health Checks
+
+In previous lessons, our Load Balancer was "blind." If an upstream server crashed, Pingora would still try to route requests to it, resulting in errors for the client (502 Bad Gateway) until the server came back online.
+
+**Active Health Checking** solves this. Pingora can actively probe your servers in the background. If a server fails to respond, it is marked "unhealthy" and removed from the rotation *before* a real user request hits it.
+
+## Key Concepts
+
+### 1. Active vs. Passive
+
+* **Passive Checking:** The load balancer watches real traffic. If 5 requests fail in a row, it marks the server down. *Downside: Real users have to see errors for the system to react.*
+* **Active Checking:** The load balancer opens a separate connection (probe) every second. If the probe fails, the server is marked down. *Upside: The system often reacts before users notice.* We are using this approach today.
+
+### 2. The `TcpHealthCheck`
+
+This is a Layer 4 check. It simply tries to establish a TCP handshake.
+
+* **Success:** Handshake completes.
+* **Failure:** Connection refused or timeout.
+
+### 3. The Race Condition
+
+There is always a tiny window between probes (e.g., 1 second) where a server could die. To handle this, we also set a short `connection_timeout` on the actual request peer. This ensures that if we *do* hit a dead server during that window, we fail fast rather than hanging for a minute.
+
+## The Code (`examples/30_health_check_tcp.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+use pingora_load_balancing::LoadBalancer;
+use pingora_load_balancing::selection::RoundRobin;
+use pingora_load_balancing::health_check::TcpHealthCheck;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // Selection: The LoadBalancer handles filtering.
+        // If a backend is marked unhealthy, select() will effectively skip it.
+        // If ALL backends are unhealthy, this returns None (mapped to Error).
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "All upstreams are down"))?;
+
+        info!("Routed to upstream: {:?}", upstream);
+
+        let mut peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "health-check.cluster".to_string()
+        ));
+        
+        // Critical: Set timeouts on the actual request peer as well.
+        // If the health check hasn't caught a failure yet (race condition window),
+        // we don't want the client waiting 60s.
+        peer.options.read_timeout = Some(Duration::from_secs(1));
+        peer.options.connection_timeout = Some(Duration::from_secs(1));
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "health-check-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 1. Initialize Load Balancer
+    let mut upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080", // Blue
+        "172.28.0.21:8080", // Green
+    ])?;
+
+    // 2. Configure the TCP Health Check
+    let mut hc = TcpHealthCheck::new();
+    // Fail Fast: probe times out after 1s
+    hc.peer_template.options.connection_timeout = Some(Duration::from_secs(1));
+    // Sensitivity: 1 failure marks it down, 1 success marks it up
+    hc.consecutive_success = 1;
+    hc.consecutive_failure = 1;
+
+    // 3. Attach Check to LB
+    upstreams.set_health_check(hc);
+    upstreams.health_check_frequency = Some(Duration::from_secs(1));
+    upstreams.parallel_health_check = true;
+
+    // 4. Background Service (The "Heart" of the health check)
+    // The health checks run inside this service.
+    let background = background_service("health_check_lb", upstreams);
+    let lb_ref = background.task();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6174");
+
+    info!("TCP Health Check LB running on 0.0.0.0:6174");
+
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify this, we will crash a server mid-stream and watch Pingora react.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 30_health_check_tcp
+```
+
+### 2. Start the Traffic Loop
+
+In a separate terminal, run a continuous check against the proxy.
+
+```bash
+while true; do docker exec pingora_client_1 curl -s http://172.28.0.10:6174/; sleep 0.5; done
+```
+
+*Output:* You should see alternating `Response from BLUE` and `Response from GREEN`.
+
+### 3. Kill Blue
+
+In a third terminal, stop the Blue container.
+
+```bash
+docker container stop pingora-guide-upstream_blue-1
+```
+
+### 4. Observe Reaction
+
+1. **Client:** The output will immediately switch to `Response from GREEN` only. You might see one single error if you hit the race window, but otherwise, it's seamless.
+2. **Logs:** You will see the detection log:
+   `[WARN] Backend { ... } becomes unhealthy, ConnectTimedout`
+
+### 5. Revive Blue
+
+Start the container again.
+
+```bash
+docker container start pingora-guide-upstream_blue-1
+```
+
+* **Logs:** `[INFO] Backend { ... } becomes healthy`
+* **Client:** Traffic seamlessly resumes alternating between Blue and Green.
+
+This confirms that Pingora is actively managing the health of your upstream pool.
