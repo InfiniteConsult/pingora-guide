@@ -3673,3 +3673,143 @@ You should see the following sequence:
 ...
 [INFO] Client: Test Complete. Closing connection.
 ```
+
+# Lesson 24: gRPC Proxy
+
+gRPC is a high-performance RPC framework that runs on top of **HTTP/2**. Unlike standard REST APIs, gRPC relies heavily on specific HTTP/2 features:
+
+* **Binary Framing:** It uses Protocol Buffers (protobufs) instead of JSON text.
+* **Trailers:** It sends status codes (like `grpc-status`) in a separate header block *after* the response body has finished.
+* **Multiplexing:** It allows multiple requests to be interleaved over a single TCP connection.
+
+To proxy gRPC traffic effectively, Pingora must be configured to establish an **HTTP/2 connection** to the upstream server. If the proxy falls back to HTTP/1.1, standard gRPC backends will often reject the connection immediately.
+
+## Key Concepts
+
+### 1. ALPN (Application-Layer Protocol Negotiation)
+
+When establishing a TLS connection, the client and server perform a handshake to decide which protocol to speak (e.g., "http/1.1" or "h2").
+
+* **The Problem:** By default, connections might settle on HTTP/1.1 for compatibility.
+* **The Fix:** We must explicitly configure Pingora's upstream peer to request `h2` during the TLS handshake.
+
+### 2. Trailers
+
+In REST, an HTTP 200 OK means success. In gRPC, an HTTP 200 OK just means "I received your message." The actual success or failure is communicated in the **Trailers** (headers sent *after* the body). Pingora supports HTTP trailers natively, ensuring this critical status information is preserved.
+
+### 3. End-to-End Encryption (and Trust)
+
+In previous steps, we generated a specific certificate for our gRPC container (`grpc.pingora.local`). Because we set the `SSL_CERT_FILE` environment variable in our docker-compose, Pingora automatically trusts our Root CA. This allows us to connect securely to the upstream without disabling certificate verification—a best practice for production gRPC services.
+
+## The Code (`examples/24_grpc_proxy.rs`)
+
+In this example, we configure Pingora to target the secure port (9001) of our `grpcbin` container. The critical line is forcing the ALPN negotiation to `H2`.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+// We import ALPN from the peer module to control protocol negotiation
+use pingora::upstreams::peer::{HttpPeer, ALPN};
+
+pub struct GrpcProxy;
+
+#[async_trait]
+impl ProxyHttp for GrpcProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Target the gRPC server (Secure Port 9001)
+        let addr = ("172.28.0.23", 9001);
+        let sni = "grpc.pingora.local";
+
+        // 1. Enable TLS
+        // Pingora will use the system trust store (defined by SSL_CERT_FILE)
+        // to verify the upstream's certificate.
+        let mut peer = Box::new(HttpPeer::new(addr, true, sni.to_string()));
+
+        // 2. Force HTTP/2 via ALPN
+        // This is mandatory. If we negotiate HTTP/1.1, most gRPC servers will
+        // close the connection or return a protocol error.
+        peer.options.alpn = ALPN::H2;
+
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Optional: Log when we see gRPC traffic
+        if let Some(ctype) = upstream_request.headers.get("content-type") {
+            if ctype.to_str().unwrap_or("").starts_with("application/grpc") {
+                info!("Proxying gRPC request...");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, GrpcProxy);
+
+    // We listen on TLS so we can support secure gRPC clients.
+    // This allows the client to negotiate H2 with Pingora as well.
+    my_proxy.add_tls(
+        "0.0.0.0:6168",
+        "conf/keys/server.crt",
+        "conf/keys/server.key"
+    ).expect("Failed to add TLS listener");
+
+    info!("gRPC Proxy running on 0.0.0.0:6168");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will use `curl` to simulate a gRPC client. Since we don't have a full gRPC client (like `grpcurl`) installed in our environment, we will manually construct a compliant HTTP/2 request.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 24_grpc_proxy
+```
+
+### 2. Send the Request
+
+We target the Pingora proxy (`172.28.0.10:6168`). We must provide the Root CA so `curl` trusts Pingora's TLS certificate.
+
+```bash
+docker exec -it pingora_client_1 curl -v \
+  --cacert /keys/ca.crt \
+  -H "Content-Type: application/grpc" \
+  -H "TE: trailers" \
+  -X POST https://172.28.0.10:6168/grpc.health.v1.Health/Check
+```
+
+### 3. Analyze the Output
+
+You should observe the following in the `curl` output:
+
+1. **Status 200 OK:** `< HTTP/1.1 200 OK` (or `HTTP/2`). This indicates the upstream accepted the connection.
+2. **gRPC Headers:** You will see headers like `Content-Type: application/grpc` and trailers like `Grpc-Status`.
+3. **Logs:** The proxy logs will show `Proxying gRPC request...`.
+
+**Note on Protocol Versions:**
+Even if your `curl` client negotiates HTTP/1.1 with Pingora (as seen in some test environments), Pingora is actively translating that traffic and speaking **HTTP/2** to the upstream `grpcbin`. This confirms that Pingora is correctly acting as a gateway, bridging the protocols as defined in our configuration.
