@@ -4016,7 +4016,6 @@ use pingora::server::configuration::Opt;
 use pingora::server::Server;
 use pingora::upstreams::peer::HttpPeer;
 use pingora::services::background::background_service;
-use pingora_load_balancing::prelude::*;
 use std::sync::Arc;
 
 // 1. The Struct holding our Load Balancer state
@@ -4142,4 +4141,168 @@ In the proxy logs, you will see the selection logic at work:
 ```text
 [INFO] Selected upstream: Backend { addr: Inet(172.28.0.20:8080), ... }
 [INFO] Selected upstream: Backend { addr: Inet(172.28.0.21:8080), ... }
+```
+
+# Lesson 27: Weighted Load Balancing
+
+In a real-world cluster, not all servers are created equal. You might have a beefy bare-metal server ("Blue") alongside a smaller virtual machine ("Green"). If you use standard Round Robin, you will overload the small server or underutilize the big one.
+
+**Weighted Load Balancing** solves this by assigning a "weight" to each backend. A server with Weight 3 receives 3x more requests than a server with Weight 1.
+
+In this lesson, we will configure:
+
+* **Upstream Blue (172.28.0.20):** Weight **3** (High Capacity).
+* **Upstream Green (172.28.0.21):** Weight **1** (Low Capacity).
+
+## Key Concepts
+
+### 1. The Initialization "Trap"
+
+In the previous lesson, we used `LoadBalancer::try_from_iter(["ip1", "ip2"])`.
+
+* **The Problem:** This convenience method takes raw strings and converts them into `Backend` objects with a **default weight of 1**. If we used it here, it would wipe out our custom weights.
+* **The Fix:** We must manually create `Backend` objects using `Backend::new_with_weight`. Then, we manually build the discovery pipeline:
+  `Backend` → `BTreeSet` → `Static Discovery` → `Backends` → `LoadBalancer`.
+
+### 2. The `RoundRobin` Type Alias
+
+You might think we need to define our balancer as `LoadBalancer<Weighted<RoundRobin>>`.
+**Do not do this.**
+In Pingora, the `RoundRobin` type you import is actually a type alias for `Weighted<algorithms::RoundRobin>`. It supports weights natively. If you try to wrap it manually, you will get complex compilation errors about unsatisfied trait bounds.
+
+## The Code (`examples/27_weighted_lb.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+
+// Key Imports for Load Balancing
+use pingora_load_balancing::{LoadBalancer, Backend, Backends};
+use pingora_load_balancing::discovery::Static;
+use pingora_load_balancing::selection::RoundRobin; // This alias includes Weighted logic
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+// The struct wraps the LoadBalancer.
+// Note: We use 'RoundRobin' as the generic type. In Pingora, the 'RoundRobin' type alias
+// is actually defined as 'Weighted<algorithms::RoundRobin>', so it supports weights natively.
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Selection: b"" key is ignored by RoundRobin.
+        // The balancer automatically handles the 3:1 distribution logic.
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        info!("Selected upstream: {:?}", upstream);
+
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "weighted.upstream".to_string()
+        ));
+
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "weighted-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 1. Create Backends with specific Weights
+    let blue = Backend::new_with_weight("172.28.0.20:8080", 3)?;
+    let green = Backend::new_with_weight("172.28.0.21:8080", 1)?;
+
+    // 2. Construct the Upstream Set Manually
+    // We CANNOT use LoadBalancer::try_from_iter() here, because that helper method
+    // extracts IPs and creates *new* Backend objects with default weight (1).
+    // We must pass our pre-weighted Backend objects into a Static discovery service.
+    let mut set = BTreeSet::new();
+    set.insert(blue);
+    set.insert(green);
+
+    let discovery = Static::new(set);
+    let backends = Backends::new(discovery);
+    let upstreams = LoadBalancer::from_backends(backends);
+
+    // 3. Create Background Service
+    let background = background_service("weighted_lb", upstreams);
+    let lb_ref = background.task();
+
+    // 4. Create Proxy Service
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6171");
+
+    info!("Weighted Load Balancer running on 0.0.0.0:6171");
+    info!("Configuration: Blue (Weight 3) vs Green (Weight 1)");
+
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 27_weighted_lb
+```
+
+### 2. Run the Traffic Test
+
+We will run `curl` 4 times. Based on our 3:1 configuration, we expect 3 responses from Blue and 1 from Green.
+
+```bash
+docker exec -it pingora_client_1 bash -c "for i in {1..4}; do curl -s http://172.28.0.10:6171/; echo; done"
+```
+
+### 3. Analyze Output
+
+You should see a pattern similar to this (order may vary slightly, but the ratio holds):
+
+```text
+'Response from BLUE'
+'Response from BLUE'
+'Response from BLUE'
+'Response from GREEN'
+```
+
+In the proxy logs, you can confirm the selection details:
+
+```text
+[INFO] Selected upstream: Backend { addr: Inet(172.28.0.20:8080), weight: 3, ... }
+[INFO] Selected upstream: Backend { addr: Inet(172.28.0.20:8080), weight: 3, ... }
+[INFO] Selected upstream: Backend { addr: Inet(172.28.0.20:8080), weight: 3, ... }
+[INFO] Selected upstream: Backend { addr: Inet(172.28.0.21:8080), weight: 1, ... }
 ```
