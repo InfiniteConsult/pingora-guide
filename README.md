@@ -4306,3 +4306,159 @@ In the proxy logs, you can confirm the selection details:
 [INFO] Selected upstream: Backend { addr: Inet(172.28.0.20:8080), weight: 3, ... }
 [INFO] Selected upstream: Backend { addr: Inet(172.28.0.21:8080), weight: 1, ... }
 ```
+
+# Lesson 28: Consistent Hashing (Ketama)
+
+In a typical load balancing setup (like Round Robin), requests are distributed evenly. However, for applications relying on **local caching** or **user sessions**, this is inefficient. If User A logs in on Server 1, but their next request goes to Server 2, they might be logged out or experience a "cold" cache.
+
+**Consistent Hashing** ensures that requests with the same "Key" (e.g., URL path, User ID, or IP address) are **always** routed to the same upstream server.
+
+In this lesson, we will implement the **Ketama** algorithm. We will route requests based on their **URL Path**:
+
+* `/user/123` → Always hits Server A.
+* `/user/456` → Always hits Server B.
+
+## Key Concepts
+
+### The Hash Ring
+
+Imagine a clock face (a ring).
+
+1. **Nodes:** We hash our servers (Blue, Green) to specific points on this ring.
+2. **Keys:** We hash the incoming request path (e.g., `/user/123`) to a point on the ring.
+3. **Routing:** To find the correct server, we move **clockwise** from the request's point until we hit a server.
+
+**Why Ketama?**
+It minimizes disruption. If you add or remove a server, only the keys immediately "behind" that server on the ring are reassigned. In standard modulo hashing (`hash % N`), changing `N` (the number of servers) would reshuffle nearly 100% of your traffic.
+
+## The Code (`examples/28_consistent_hashing.rs`)
+
+We configure the `LoadBalancer` to use `KetamaHashing` as its selection strategy. The critical change happens in `upstream_peer`, where we extract the path and pass it as the hash key.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+
+use pingora_load_balancing::LoadBalancer;
+// Import the specific Ketama algorithm
+use pingora_load_balancing::selection::consistent::KetamaHashing;
+use std::sync::Arc;
+
+// 1. The Struct: Wraps LoadBalancer with the KetamaHashing strategy
+pub struct LB(Arc<LoadBalancer<KetamaHashing>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // 2. The Key: Extract the path from the request URI
+        // This is what makes the routing "sticky" to the URL.
+        let path = session.req_header().uri.path();
+        let key = path.as_bytes();
+
+        // 3. Selection: Pass the path as the hash key.
+        // This ensures Deterministic Routing: Same Key -> Same Server.
+        let upstream = self.0
+            .select(key, 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        info!("Path '{}' hashed to upstream: {:?}", path, upstream);
+
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "consistent.cluster".to_string()
+        ));
+
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "consistent-hash-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 4. Initialization: Create the pool.
+    // Ketama handles distribution via the ring, so 'try_from_iter' is sufficient.
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080", // Blue
+        "172.28.0.21:8080", // Green
+    ])?;
+
+    // 5. Background Service: Essential for LB maintenance
+    let background = background_service("consistent_lb", upstreams);
+    let lb_ref = background.task();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6172");
+
+    info!("Consistent Hashing LB running on 0.0.0.0:6172");
+    info!("Try: curl http://127.0.0.1:6172/user/123 vs /user/456");
+
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify that the hashing is consistent, we need to show that requesting the same URL repeatedly *always* results in the same backend being chosen, but different URLs might map to different backends.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 28_consistent_hashing
+```
+
+### 2. Run the Test Loop
+
+Run the following command in your client terminal. It loops through 5 different "User IDs" (paths), hitting each one twice.
+
+```bash
+docker exec -it pingora_client_1 bash -c "for i in {1..5}; do curl -s http://172.28.0.10:6172/user/\$i; echo; curl -s http://172.28.0.10:6172/user/\$i; echo; echo ---; done"
+```
+
+### 3. Analyze Results
+
+You will observe **Sticky** behavior:
+
+* **User 1:** Might go to **Green** both times.
+* **User 3:** Might go to **Blue** both times.
+* Unlike Round Robin, you will never see `/user/1` go to Blue and then immediately swap to Green.
+
+**Sample Log Output:**
+
+```text
+[INFO] Path '/user/1' hashed to upstream: Backend { addr: Inet(172.28.0.21:8080)... }
+[INFO] Path '/user/1' hashed to upstream: Backend { addr: Inet(172.28.0.21:8080)... }
+...
+[INFO] Path '/user/3' hashed to upstream: Backend { addr: Inet(172.28.0.20:8080)... }
+[INFO] Path '/user/3' hashed to upstream: Backend { addr: Inet(172.28.0.20:8080)... }
+```
+
+This confirms that Pingora is correctly using the path as a stable routing key.
