@@ -3813,3 +3813,153 @@ You should observe the following in the `curl` output:
 
 **Note on Protocol Versions:**
 Even if your `curl` client negotiates HTTP/1.1 with Pingora (as seen in some test environments), Pingora is actively translating that traffic and speaking **HTTP/2** to the upstream `grpcbin`. This confirms that Pingora is correctly acting as a gateway, bridging the protocols as defined in our configuration.
+
+# Lesson 25: Connection Reuse (Pooling)
+
+Establishing a new TCP connection (and potentially a TLS handshake) for every single request is expensive. It adds significant latency and consumes CPU on both the proxy and the upstream.
+
+**Connection Reuse** (or "Keep-Alive") allows Pingora to keep a connection to an upstream open after a request finishes, putting it into a "Pool." When a new request arrives for that same upstream, Pingora checks the pool first. If a healthy connection exists, it reuses it—skipping the handshake entirely.
+
+In this lesson, we will configure connection pooling and, critically, **prove** it works by capturing the reuse flag using Pingora's lifecycle hooks.
+
+## Key Concepts
+
+### 1. The `CTX` (Context) Pattern
+
+Since Pingora's request lifecycle is split across multiple asynchronous phases, variables don't persist automatically between them. To track whether a connection was reused, we must:
+
+1. Define a custom `CTX` struct.
+2. Capture the `reused` boolean in the `connected_to_upstream` hook.
+3. Store it in our `CTX`.
+4. Read it back in the `logging` hook.
+
+### 2. Tuning the Pool
+
+* **`idle_timeout`:** How long a connection can sit in the pool doing nothing before Pingora closes it. If this is too short (e.g., 0), reuse will never happen.
+* **`pool_max_idle`**: (Global setting, not shown here) Limits how many idle connections we keep per peer.
+
+## The Code (`examples/25_connection_reuse.rs`)
+
+We define a `ReusingCtx` to hold our state, and implement the `connected_to_upstream` hook to intercept the connection event.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::protocols::Digest;
+use std::time::Duration;
+
+pub struct ReusingProxy;
+
+// 1. Define a Context to hold state across the request lifecycle
+pub struct ReusingCtx {
+    pub is_reused: bool,
+}
+
+#[async_trait]
+impl ProxyHttp for ReusingProxy {
+    // 2. Use the custom Context type
+    type CTX = ReusingCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        ReusingCtx { is_reused: false }
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // Target Upstream Blue
+        let addr = ("172.28.0.20", 8080);
+        let mut peer = Box::new(HttpPeer::new(addr, false, "blue.pingora.local".to_string()));
+
+        // --- CONNECTION REUSE CONFIGURATION ---
+        
+        // idle_timeout: Controls how long an idle connection stays in the pool.
+        // We set this to 30s. If we set this to 0, the connection would likely 
+        // close immediately after use, preventing reuse.
+        peer.options.idle_timeout = Some(Duration::from_secs(30));
+
+        peer.options.connection_timeout = Some(Duration::from_secs(1));
+
+        Ok(peer)
+    }
+
+    // 3. Intercept the connection step to capture the 'reused' flag
+    // This hook runs immediately after Pingora gets a connection (either new or from pool).
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        reused: bool,                 // <--- The flag we want!
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _digest: Option<&Digest>,
+        ctx: &mut Self::CTX,          // <--- Our mutable context
+    ) -> Result<()> {
+        // Store the status in our context for logging later
+        ctx.is_reused = reused;
+        Ok(())
+    }
+
+    async fn logging(
+        &self,
+        _session: &mut Session,
+        _e: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,          // <--- Access the stored context
+    ) {
+        // 4. Log the state to prove reuse happened
+        info!("Request Complete. Reused Connection: {}", ctx.is_reused);
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, ReusingProxy);
+    my_proxy.add_tcp("0.0.0.0:6169");
+
+    info!("Connection Reuse Demo running on 0.0.0.0:6169");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify reuse, we need to send requests fast enough that the previous connection hasn't timed out yet. Using `curl` with two URLs in a single command is a great way to do this.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 25_connection_reuse
+```
+
+### 2. Send Sequential Requests
+
+We ask `curl` to fetch the same URL twice in a row.
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6169/ http://172.28.0.10:6169/
+```
+
+### 3. Analyze the Logs
+
+You will see exactly how the pooling mechanism works:
+
+```text
+[INFO] Request Complete. Reused Connection: false
+[INFO] Request Complete. Reused Connection: true
+```
+
+* **Request 1 (`false`):** The pool was empty. Pingora had to perform a TCP handshake with `172.28.0.20`.
+* **Request 2 (`true`):** Pingora checked the pool, found the live connection from Request 1, and reused it immediately.
+
+This "0-RTT" (Zero Round Trip Time) connection setup is vital for high-performance proxies.
