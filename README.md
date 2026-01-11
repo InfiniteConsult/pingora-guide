@@ -3427,3 +3427,249 @@ Observe the `stdout` of your running Rust program. You should see the following 
 ### 4. Why this matters
 
 If you attempted to use `HttpPeer::new_proxy` with a TCP address, you would have seen an error like `No such file or directory` (OS Error 2). This confirms that native support is lacking for TCP, and that our "Hijack" method is currently the correct way to implement TCP Tunneling in Pingora.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Lesson 23: WebSocket Upgrade
+
+## 1. WebSockets
+In modern real-time applications (chat apps, live sports feeds, stock tickers), the request-response model of HTTP is often insufficient. These applications rely on **WebSockets**, which allow for persistent, bidirectional communication between the client and the server.
+
+A WebSocket connection begins its life as a standard HTTP request but quickly "upgrades" into a raw TCP stream. In this lesson, we will configure Pingora to handle this upgrade process and maintain these long-lived connections.
+
+## 2. How the Upgrade Works
+
+The WebSocket protocol (RFC 6455) uses a specific "handshake" to establish the connection:
+
+1. **Client Request:** The client sends an HTTP GET request with two special headers:
+   * `Connection: Upgrade`
+   * `Upgrade: websocket`
+2. **Proxy Behavior:** Pingora forwards this request to the upstream.
+3. **Upstream Response:** If the upstream accepts the upgrade, it replies with `101 Switching Protocols`.
+4. **The Switch:** Upon receiving the 101 status, both the client and the upstream (and the proxy in the middle) stop speaking HTTP. They switch to the WebSocket binary protocol over the same underlying TCP connection.
+
+## 3. The Critical Challenge: Timeouts
+
+The most common issue when proxying WebSockets is premature disconnection.
+
+* **HTTP Mindset:** HTTP proxies are designed for short bursts of activity. If a connection is idle for 60 seconds, it's usually considered dead or "stuck," and the proxy kills it to free up resources.
+* **WebSocket Reality:** WebSockets are often idle for long periods (e.g., waiting for a chat message).
+
+**The Solution:**
+When configuring the `HttpPeer` for WebSocket traffic, we must explicitly **disable or extend the read/write timeouts**. If we leave the defaults (e.g., 60s), Pingora will aggressively terminate perfectly healthy WebSocket connections during quiet periods.
+
+## 4. Setup for this Lesson
+
+To demonstrate a complete WebSocket lifecycle without external dependencies, we will build a self-contained system in a single file:
+
+1. **The Echo Server (Background Thread):** A simple server using `tokio-tungstenite` that accepts WebSocket connections and echoes back any text it receives with a timestamp.
+2. **The Test Client (Background Thread):** A script that connects to our proxy, sends a "Ping" every second, and logs the "Pong" it receives.
+3. **The Pingora Proxy:** The intermediary that routes the traffic between them.
+
+This "Self-Driving" example allows you to verify the entire flow—handshake, message passing, and termination—just by watching the logs.
+
+## 5. The Code (`examples/23_websocket_upgrade.rs`)
+
+First, ensure your `Cargo.toml` includes the necessary dependencies for handling WebSockets and time formatting.
+
+```toml
+[dependencies]
+# ... previous dependencies ...
+tokio-tungstenite = "0.28.0"
+futures-util = "0.3.31"
+chrono = "0.4.42"
+```
+
+The following code sets up a complete ecosystem: a Proxy, a Mock Server, and a Test Client.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::time::sleep;
+
+// WebSocket Dependencies
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::{accept_async, connect_async, tungstenite::protocol::Message};
+
+pub struct WebSocketProxy;
+
+#[async_trait]
+impl ProxyHttp for WebSocketProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Forward to the Mock Server running in the background
+        let addr = ("127.0.0.1", 9091);
+        let mut peer = Box::new(HttpPeer::new(addr, false, "".to_string()));
+
+        // CRITICAL: WebSocket Configuration
+        // 1. read_timeout: Set to None (infinity). WebSockets are often idle.
+        //    If we leave the default (e.g., 60s), Pingora will kill the connection.
+        // 2. connection_timeout: Standard TCP connect timeout.
+        peer.options.read_timeout = None;
+        peer.options.write_timeout = None;
+        peer.options.connection_timeout = Some(Duration::from_secs(5));
+
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Pingora automatically preserves the "Connection" and "Upgrade" headers
+        // required for the handshake. We log here purely for visibility.
+        if let Some(upgrade) = upstream_request.headers.get("Upgrade") {
+            info!("Proxy: Detected Upgrade Header: {:?}", upgrade);
+        }
+        Ok(())
+    }
+}
+
+// --- Background Task: The Upstream Server ---
+async fn run_echo_server() {
+    let addr = "127.0.0.1:9091";
+    let listener = TcpListener::bind(addr).await.expect("Failed to bind Echo Server.");
+    info!("Echo Server listening on {}", addr);
+
+    while let Ok((stream, _)) = listener.accept().await {
+        tokio::spawn(async move {
+            let mut ws_stream = accept_async(stream).await.expect("Failed to accept WS");
+            
+            while let Some(msg) = ws_stream.next().await {
+                let msg = msg.expect("Error reading message.");
+                if msg.is_text() {
+                    let text = msg.to_text().unwrap();
+                    // Reply with a timestamped echo
+                    let response_text = format!("Echo [{}]: {}", chrono::Local::now().format("%H:%M:%S"), text);
+
+                    info!("Server: Received '{}', Replying...", text);
+                    ws_stream.send(Message::Text(response_text.into())).await.unwrap();
+                }
+            }
+        });
+    }
+}
+
+// --- Background Task: The Test Client ---
+async fn run_test_client() {
+    // Wait for Proxy to bind port
+    sleep(Duration::from_secs(2)).await;
+
+    let url = "ws://127.0.0.1:6167";
+    info!("Client: Connection to Proxy at {}", url);
+
+    let (mut ws_stream, _) = connect_async(url).await.expect("Failed to connect to proxy.");
+    info!("Client: Connected! Starting message loop...");
+
+    // Send 3 Pings with a 1-second delay
+    for i in 1..=3 {
+        let msg = format!("Ping #{}", i);
+        ws_stream.send(Message::Text(msg.into())).await.expect("Failed to send");
+
+        if let Some(resp) = ws_stream.next().await {
+            let resp_msg = resp.expect("Failed to read response");
+            info!("Client: Received '{}'", resp_msg.to_text().unwrap());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    info!("Client: Test Complete. Closing connection.");
+    ws_stream.close(None).await.unwrap();
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Spawn Background Services
+    let _server_handle = std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_echo_server());
+    });
+
+    let _client_handle = std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_test_client());
+    });
+
+    // Start Proxy Service
+    let mut my_proxy = http_proxy_service(&my_server.configuration, WebSocketProxy);
+    my_proxy.add_tcp("0.0.0.0:6167");
+
+    info!("WebSocket Proxy running on 0.0.0.0:6167");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## 6. Verification
+
+This script verifies itself automatically. When you run it, you will see the logs from all three components (Client, Proxy, Server) interleaved, showing the flow of data.
+
+**1. Run the Example**
+
+```bash
+RUST_LOG=info cargo run --example 23_websocket_upgrade
+```
+
+**2. Analyze the Output**
+You should see the following sequence:
+
+1. **Setup:** The Proxy and Echo Server start.
+2. **Handshake:** The Client connects (`ws://127.0.0.1:6167`). The Proxy detects the `Upgrade` header.
+3. **Traffic:** The Client sends "Ping #1". The Server receives it and replies with "Echo [Time]: Ping #1".
+4. **Repeat:** This happens 3 times over the same persistent connection.
+
+**Sample Log Output:**
+
+```text
+[INFO] Echo Server listening on 127.0.0.1:9091
+[INFO] WebSocket Proxy running on 0.0.0.0:6167
+[INFO] Client: Connection to Proxy at ws://127.0.0.1:6167
+[INFO] Proxy: Detected Upgrade Header: "websocket"
+[INFO] Client: Connected! Starting message loop...
+[INFO] Client: Sending 'Ping #1'
+[INFO] Server: Received 'Ping #1', Replying...
+[INFO] Client: Received 'Echo [11:00:19]: Ping #1'
+...
+[INFO] Client: Test Complete. Closing connection.
+```
