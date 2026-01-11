@@ -4462,3 +4462,200 @@ You will observe **Sticky** behavior:
 ```
 
 This confirms that Pingora is correctly using the path as a stable routing key.
+
+# Lesson 29: Sticky Sessions (Cookie-Based)
+
+In the previous lesson, we used **Consistent Hashing** on the *URL Path*. This ensures that `/image.png` always comes from the same server, which is great for caching.
+
+However, for stateful applications (e.g., a shopping cart or a login session), we need **User Affinity**. We want User A to stay on Server Blue, regardless of whether they visit `/home`, `/profile`, or `/cart`.
+
+To achieve this, we combine **Consistent Hashing** with **Cookies**.
+
+## Key Concepts
+
+### 1. The Session Cookie
+
+The logic flow is:
+
+1. **Incoming Request:** Does it have a `session-id` cookie?
+2. **No (New User):** Generate a new ID (e.g., `user-100`), hash it to pick a server, and send a `Set-Cookie` header so the client remembers it.
+3. **Yes (Returning User):** Extract the ID, hash it (which results in the exact same server), and route the request.
+
+### 2. The Context (`CTX`) Bridge
+
+This lesson demonstrates a critical pattern in Pingora: **Sharing state between Request and Response phases.**
+
+* We detect/generate the session ID in `upstream_peer` (Request Phase).
+* We need to write the `Set-Cookie` header in `response_filter` (Response Phase).
+* We use a custom `StickyCtx` struct to carry this data across the lifecycle.
+
+## The Code (`examples/29_sticky_sessions.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+use pingora::http::ResponseHeader;
+use pingora_load_balancing::LoadBalancer;
+use pingora_load_balancing::selection::consistent::KetamaHashing;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// Global counter to generate simple unique session IDs for this demo
+static SESSION_COUNTER: AtomicUsize = AtomicUsize::new(100);
+
+// 1. Context: Holds state between the Request phase and the Response phase.
+// If we generate a new ID, we must store it here to inject the Set-Cookie header later.
+pub struct StickyCtx {
+    pub new_session_id: Option<String>,
+}
+
+// Struct wrapping the Ketama-based Load Balancer
+pub struct LB(Arc<LoadBalancer<KetamaHashing>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = StickyCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        StickyCtx { new_session_id: None }
+    }
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        let mut session_id = String::new();
+
+        // 2. Cookie Parsing Logic
+        // We look for "Cookie: session-id=xyz".
+        if let Some(cookie_val) = session.req_header().headers.get("Cookie") {
+            let cookie_str = cookie_val.to_str().unwrap_or("");
+            for part in cookie_str.split(';') {
+                let part = part.trim();
+                if part.starts_with("session-id=") {
+                    session_id = part.trim_start_matches("session-id=").to_string();
+                    info!("Found existing session cookie: {}", session_id);
+                    break;
+                }
+            }
+        }
+
+        // 3. New Session Generation
+        // If no cookie was found, create a new ID and mark it for injection.
+        if session_id.is_empty() {
+            let new_id = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            session_id = format!("user-{}", new_id);
+            
+            info!("No cookie found. Generated new session id: {}", session_id);
+            ctx.new_session_id = Some(session_id.clone());
+        }
+
+        // 4. Consistent Hashing Selection
+        // Crucial: Use the session_id as the hash key, NOT the request path.
+        let key = session_id.as_bytes();
+        let upstream = self.0
+            .select(key, 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        info!("Session '{}' stuck to upstream: {:?}", session_id, upstream);
+
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "sticky.cluster".to_string()
+        ));
+
+        Ok(peer)
+    }
+
+    // 5. Response Filter
+    // Injects the Set-Cookie header if we generated a new session ID.
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(new_id) = &ctx.new_session_id {
+            let cookie_value = format!("session-id={}; Path=/", new_id);
+            upstream_response.insert_header("Set-Cookie", cookie_value)?;
+            info!("Injected Set-Cookie header for {}", new_id);
+        }
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 6. Initialization
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080", // Blue
+        "172.28.0.21:8080", // Green
+    ])?;
+
+    let background = background_service("sticky_lb", upstreams);
+    let lb_ref = background.task();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6173");
+
+    info!("Sticky Session LB running on 0.0.0.0:6173");
+    
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify sticky sessions, we must act like a browser that saves cookies. We will use `curl`'s "cookie jar" feature.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 29_sticky_sessions
+```
+
+### 2. The First Visit (New User)
+
+Run this command. It saves received cookies to `cookies.txt`.
+
+```bash
+docker exec -it pingora_client_1 curl -v -c /cookies.txt http://172.28.0.10:6173/
+```
+
+* **Result:** You will see `< Set-Cookie: session-id=user-100; Path=/`.
+* **Routing:** The logs will show "No cookie found" and routing to a specific server (e.g., Green).
+
+### 3. The Second Visit (Returning User)
+
+Run this command. It reads cookies from `cookies.txt`.
+
+```bash
+docker exec -it pingora_client_1 curl -v -b /cookies.txt http://172.28.0.10:6173/
+```
+
+* **Result:** You will see `> Cookie: session-id=user-100`.
+* **Routing:** The logs will show "Found existing session cookie" and routing to **Green** (the same server).
+
+### 4. The Third Visit (Different URL)
+
+Try a different path:
+
+```bash
+docker exec -it pingora_client_1 curl -v -b /cookies.txt http://172.28.0.10:6173/different/path
+```
+
+* **Result:** Still routed to **Green**. The routing is now tied to the *User*, not the *URL*.
