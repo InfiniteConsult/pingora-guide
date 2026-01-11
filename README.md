@@ -3963,3 +3963,18 @@ You will see exactly how the pooling mechanism works:
 * **Request 2 (`true`):** Pingora checked the pool, found the live connection from Request 1, and reused it immediately.
 
 This "0-RTT" (Zero Round Trip Time) connection setup is vital for high-performance proxies.
+
+# Module 4: Load Balancing
+
+Up to this point, our proxy has been a **1-to-1** conduit. We accepted a request and forwarded it to a single, hardcoded destination (e.g., `172.28.0.20`).
+
+In **Module 4**, we graduate to **1-to-N** routing. We are no longer just "proxying"; we are **distributing** traffic. This module focuses on the `pingora-load-balancing` crate, which provides the logic to manage pools of upstream servers, ensuring high availability, scalability, and efficiency.
+
+We will move away from defining a single `HttpPeer` and start defining **Clusters** of backends. We will explore:
+
+* **Selection Algorithms:** How does Pingora decide which server gets the next request? (Round Robin, Weighted, Hashing).
+* **Health Checking:** How does Pingora automatically detect and remove dead servers from rotation *before* they cause errors?
+* **Session Persistence:** How do we ensure a user always returns to the same backend for stateful applications?
+* **Dynamic Discovery:** How do we update our list of backends without restarting the server?
+
+This is where Pingora transforms from a simple pipe into a robust Edge Gateway capable of handling production-scale traffic.
