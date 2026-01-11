@@ -3328,9 +3328,6 @@ impl ProxyHttp for TunnelProxy {
 
         peer.options.custom_l4 = Some(Arc::new(connector));
         
-        // Disable verification because our lab certs are self-signed
-        peer.options.verify_cert = false; 
-
         Ok(peer)
     }
 

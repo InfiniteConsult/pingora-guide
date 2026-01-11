@@ -90,8 +90,6 @@ impl ProxyHttp for TunnelProxy {
         };
 
         peer.options.custom_l4 = Some(Arc::new(connector));
-        peer.options.verify_cert = false;
-
         Ok(peer)
     }
 
