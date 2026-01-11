@@ -3127,3 +3127,313 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6165/auth
 
 *Result:* `200 OK`.
 *Body:* `Response from mTLS Protected Upstream. Hello, Authenticated Client!`
+
+
+
+
+
+# Lesson 22: Proxy Connect (Tunneling)
+
+## 1. Proxy Tunnels
+
+In enterprise environments, direct internet access is rarely granted to backend servers. Instead, all outbound traffic must pass through a designated **Forward Proxy** (like Squid, Zscaler, or an AWS NAT Gateway).
+
+If your Pingora instance is running in such a restricted environment, it cannot simply open a TCP connection to `api.stripe.com`. It must ask the corporate proxy to open that connection on its behalf. This is achieved using the HTTP **`CONNECT`** method.
+
+In this lesson, we will implement a custom connector that allows Pingora to "tunnel" through an intermediate proxy to reach a secure upstream.
+
+---
+
+## 2. Understanding HTTP `CONNECT`
+
+The `CONNECT` method is unique because it asks the proxy to stop acting like an HTTP parser and start acting like a blind pipe. This is essential for secure traffic (HTTPS), because the intermediate proxy cannot read the encrypted data—it just shovels bytes back and forth.
+
+### The "Double Handshake"
+
+Tunneling involves two distinct connection phases:
+
+1. **The Setup (Plaintext):**
+   The client (Pingora) connects to the **Proxy** and sends a `CONNECT` request specifying the ultimate destination.
+```http
+CONNECT advanced.pingora.local:443 HTTP/1.1
+Host: advanced.pingora.local:443
+
+```
+
+
+2. **The Tunnel (Encrypted):**
+   If allowed, the Proxy connects to the destination and replies `200 Connection Established`.
+   At this precise moment, the connection transforms. The HTTP layer vanishes, and it becomes a raw TCP stream. Pingora then initiates the TLS handshake *through* this stream, effectively talking directly to the destination.
+
+---
+
+## 3. The Challenge: Pingora's Limitation
+
+As of today, Pingora's high-level API (`peer.proxy`) is optimized for Unix Domain Sockets (UDS). It does **not** natively support configuring a standard TCP/IP address (like `10.0.0.5:3128`) as a forward proxy.
+
+If you attempt to set `peer.proxy` to a standard HTTP proxy address, Pingora will struggle to establish the connection because it expects a local socket file path.
+
+**The Consequence:** We cannot rely on simple configuration flags. To support this common enterprise requirement, we must extend Pingora's networking capabilities manually.
+
+---
+
+## 4. The Solution: Transport Layer Hijacking
+
+To solve this, we will use Pingora's `L4Connect` trait. This powerful interface allows us to intercept the "Dialing" phase of the connection lifecycle.
+
+We will implement a custom connector that performs a "Bait and Switch" operation:
+
+1. **Intercept the Dial:** When Pingora asks to connect to a peer, our custom code takes over.
+2. **Dial the Proxy:** Instead of connecting to the Upstream, we physically connect to the **Forward Proxy IP** (e.g., `127.0.0.1:3128`).
+3. **Perform the Handshake:** We manually write the `CONNECT` headers to the socket and wait for the `200 OK` response.
+4. **Return the Socket:** We hand this established tunnel back to Pingora.
+
+Pingora's core doesn't know (or care) that the socket is tunneled. It simply sees a valid TCP stream and proceeds to perform the TLS handshake on top of it.
+
+### The "FD Mismatch" Trap
+
+There is one critical safety mechanism we must navigate: **File Descriptor (FD) Reuse Checks**.
+Pingora checks if the connected socket's remote address matches the configured `HttpPeer` address.
+
+* **If we configure:** Peer = `advanced.pingora.local`
+* **But we connect to:** Socket = `127.0.0.1`
+
+Pingora will detect this mismatch ("I asked for X but you gave me Y!") and close the connection to prevent security risks.
+
+**The Fix:** We must align the physical and logical layers:
+
+* **Physical Layer:** We configure the `HttpPeer` address to be the **Proxy's IP**. This satisfies the safety check.
+* **Logical Layer:** We manually set the **SNI** and **Host Header** to the **Upstream's Domain**. This ensures the TLS handshake and HTTP request are valid for the destination.
+
+## 5. The Code (`examples/22_proxy_connect.rs`)
+
+This implementation is advanced because it requires us to touch three different layers of the networking stack simultaneously:
+
+1. **Layer 4 (Transport):** We physically connect to the Proxy IP.
+2. **Layer 5 (Session):** We manually negotiate the HTTP `CONNECT` tunnel.
+3. **Layer 7 (Application):** We lie to the application layer, telling it we are connecting to the Upstream Host so that SNI and Host headers are generated correctly.
+
+### The Components
+
+* **`ProxyTunnelConnector`**: This struct implements `L4Connect`. It is the "driver" that Pingora uses when it needs to establish a TCP connection. Instead of dialing the destination, it dials the proxy, negotiates the tunnel, and returns the active socket.
+* **`TunnelProxy`**: The main proxy logic. Its job is to configure the `HttpPeer` with the **Physical Address** (Proxy IP) to satisfy safety checks, while injecting our custom connector to handle the **Logical Connection** (Target Host).
+* **`run_mock_forward_proxy`**: A minimal TCP proxy running in the background to simulate a corporate firewall like Zscaler or Squid.
+
+```rust
+use async_trait::async_trait;
+use log::{error, info};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::connectors::L4Connect;
+// We alias the specific Stream type Pingora expects for L4 connections
+use pingora::protocols::l4::stream::Stream as L4Stream;
+use pingora::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+// --- COMPONENT 1: The Custom Connector ---
+// This acts as the "Client" in the CONNECT handshake.
+#[derive(Debug)]
+struct ProxyTunnelConnector {
+    proxy_addr: SocketAddr, // Physical: Where packets go (127.0.0.1:3128)
+    remote_host: String,    // Logical: Who we want to reach (advanced.pingora.local)
+    remote_port: u16,       // Logical: Port (443)
+}
+
+#[async_trait]
+impl L4Connect for ProxyTunnelConnector {
+    // Pingora calls this method when it wants to open a connection.
+    // We ignore the `_addr` argument provided by Pingora because we are hijacking the destination.
+    async fn connect(&self, _addr: &PingoraSocketAddr) -> Result<L4Stream> {
+        info!("Connector: Dialing Proxy at {:?}...", self.proxy_addr);
+        
+        // 1. Establish Physical TCP Connection
+        let mut socket = TcpStream::connect(self.proxy_addr).await.map_err(|e| {
+            Error::explain(ErrorType::ConnectError, format!("Failed to connect to proxy: {}", e))
+        })?;
+
+        // 2. Perform the HTTP CONNECT Handshake
+        // We construct a raw HTTP request asking the proxy to open a tunnel.
+        let connect_req = format!(
+            "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
+            self.remote_host, self.remote_port, self.remote_host, self.remote_port
+        );
+
+        info!("Connector: Sending CONNECT request for {}:{}", self.remote_host, self.remote_port);
+        socket.write_all(connect_req.as_bytes()).await.map_err(|e| {
+            Error::explain(ErrorType::WriteError, format!("Failed to write CONNECT req: {}", e))
+        })?;
+
+        // 3. Verify the Tunnel
+        // We must read the response headers to ensure we got a "200 Connection Established".
+        let mut buf = [0u8; 4096];
+        let n = socket.read(&mut buf).await.map_err(|e| {
+            Error::explain(ErrorType::ReadError, format!("Failed to read proxy resp: {}", e))
+        })?;
+
+        let response = String::from_utf8_lossy(&buf[..n]);
+        if !response.contains(" 200 ") {
+             return Err(Error::explain(
+                ErrorType::ConnectProxyFailure,
+                format!("Proxy refused tunnel: {}", response.lines().next().unwrap_or("Unknown"))
+            ));
+        }
+
+        info!("Connector: Tunnel established! Handing socket to Pingora core.");
+        
+        // 4. Handover
+        // We wrap the standard Tokio TcpStream into Pingora's L4Stream wrapper.
+        // Pingora's TLS layer will now take this socket and perform the SSL Handshake *over* it.
+        Ok(L4Stream::from(socket))
+    }
+}
+
+// --- COMPONENT 2: The Main Proxy Logic ---
+pub struct TunnelProxy;
+
+#[async_trait]
+impl ProxyHttp for TunnelProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        let upstream_host = "advanced.pingora.local";
+        let upstream_port = 443;
+        
+        // The Proxy's physical address (The "Next Hop")
+        let proxy_addr_str = "127.0.0.1:3128";
+        let proxy_socket_addr: SocketAddr = proxy_addr_str.parse().unwrap();
+
+        // THE CRITICAL CONFIGURATION:
+        // 1. Peer Address: Set to the PROXY IP. 
+        //    This prevents "FD Mismatch" errors. Pingora checks: "Is the socket connected to 
+        //    the address in the peer struct?" Since our connector dials 127.0.0.1, this must match.
+        // 2. SNI: Set to the UPSTREAM HOST.
+        //    This ensures the ClientHello generated by Pingora asks for the correct certificate.
+        let mut peer = Box::new(HttpPeer::new(
+            proxy_socket_addr,        // Address matches physical socket
+            true,                     // TLS matches final destination
+            upstream_host.to_string() // SNI matches final destination
+        ));
+
+        // 3. Inject the Custom Connector
+        // This overrides the default logic of "Just dial the Peer Address".
+        let connector = ProxyTunnelConnector {
+            proxy_addr: proxy_socket_addr,
+            remote_host: upstream_host.to_string(),
+            remote_port: upstream_port,
+        };
+
+        peer.options.custom_l4 = Some(Arc::new(connector));
+        
+        // Disable verification because our lab certs are self-signed
+        peer.options.verify_cert = false; 
+
+        Ok(peer)
+    }
+
+    // 4. Override the Host Header
+    // Even though we are physically talking to 127.0.0.1, the HTTP request 
+    // inside the encrypted tunnel must look like it's going to the upstream.
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "advanced.pingora.local")?;
+        Ok(())
+    }
+}
+
+// --- COMPONENT 3: Mock Forward Proxy (Background Task) ---
+// Simulates a corporate proxy that accepts CONNECT requests.
+async fn run_mock_forward_proxy() {
+    let addr = "0.0.0.0:3128";
+    let listener = TcpListener::bind(addr).await.expect("Failed to bind Mock Proxy");
+    info!("Mock Proxy listening on {}", addr);
+
+    loop {
+        if let Ok((mut client_socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let n = client_socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 { return; }
+
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.starts_with("CONNECT") {
+                    info!("Mock Proxy: Connecting to upstream_advanced...");
+                    // In a real proxy, we would parse the requested host.
+                    // Here we hardcode the destination for the lab.
+                    if let Ok(mut upstream) = TcpStream::connect("172.28.0.22:443").await {
+                        // Reply "Success" to the client
+                        let _ = client_socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                        // Enter "Blind Pipe" mode
+                        let _ = tokio::io::copy_bidirectional(&mut client_socket, &mut upstream).await;
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Start the mock proxy in a background thread
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_mock_forward_proxy());
+    });
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, TunnelProxy);
+    my_proxy.add_tcp("0.0.0.0:6166");
+
+    info!("Pingora Tunnel Service running on 0.0.0.0:6166");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## 6. Verification
+
+We will confirm that traffic is actually flowing through the proxy by observing the logs from our Mock Proxy component.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 22_proxy_connect
+```
+
+### 2. Make the Request
+
+We send a request to the Pingora listener (port 6166). We expect Pingora to transparently handle the complex tunneling.
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6166/
+```
+
+### 3. Log Analysis
+
+Observe the `stdout` of your running Rust program. You should see the following sequence of events:
+
+1. **`Connector: Dialing Proxy...`**: The `upstream_peer` hook executed, and our custom connector was invoked. It is connecting to `127.0.0.1:3128`.
+2. **`Mock Proxy: Connecting to upstream_advanced...`**: The background thread received the connection and the `CONNECT` header.
+3. **`Connector: Tunnel established!`**: The Mock Proxy replied with `200 OK`, and our connector handed the socket back to Pingora.
+4. **`Response from Advanced Upstream...`**: Pingora successfully performed the TLS handshake *inside* the tunnel and retrieved the response.
+
+### 4. Why this matters
+
+If you attempted to use `HttpPeer::new_proxy` with a TCP address, you would have seen an error like `No such file or directory` (OS Error 2). This confirms that native support is lacking for TCP, and that our "Hijack" method is currently the correct way to implement TCP Tunneling in Pingora.
