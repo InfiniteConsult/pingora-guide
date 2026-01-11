@@ -3978,3 +3978,168 @@ We will move away from defining a single `HttpPeer` and start defining **Cluster
 * **Dynamic Discovery:** How do we update our list of backends without restarting the server?
 
 This is where Pingora transforms from a simple pipe into a robust Edge Gateway capable of handling production-scale traffic.
+
+# Lesson 26: Round Robin Load Balancing
+
+In previous modules, our proxy acted as a simple pipe: one listener mapped to one upstream. In **Module 4**, we unlock the power of **Load Balancing**, transforming Pingora into a gateway that distributes traffic across a cluster of servers.
+
+We start with the most fundamental algorithm: **Round Robin**. This strategy rotates requests sequentially through the list of available backends (`Blue -> Green -> Blue -> Green`). It is ideal for stateless services where all backends have roughly equal capacity.
+
+## Key Concepts
+
+### 1. The `LoadBalancer` Struct
+
+The `pingora_load_balancing::LoadBalancer<S>` struct is the "brain" of this module.
+
+* **Inventory:** It holds the list of all backend servers.
+* **State:** It tracks which servers are healthy (and eligible for traffic) and which are not.
+* **Strategy (`S`):** It is generic over a selection algorithm. In this lesson, we specify `LoadBalancer<RoundRobin>`.
+
+### 2. The Background Service
+
+Load balancing involves more than just picking a random IP. It often requires active maintenance tasks like:
+
+* Pinging servers to check if they are alive (Health Checks).
+* Querying DNS or APIs to find new servers (Service Discovery).
+
+To perform these tasks without blocking the main proxy thread, Pingora runs the `LoadBalancer` as a separate **Background Service**. Even if we provide a static list of IPs (as we do here), using this architecture from the start prepares us for dynamic features later.
+
+## The Code (`examples/26_round_robin.rs`)
+
+This code sets up a Load Balancer with two upstreams (`Blue` and `Green`) and routes traffic between them.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+use pingora_load_balancing::prelude::*;
+use std::sync::Arc;
+
+// 1. The Struct holding our Load Balancer state
+// We wrap it in Arc so it can be shared between the Background Service (which updates it)
+// and the Proxy Service (which reads from it).
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // 2. Load Balancing Selection
+        // select() takes a key (for hashing) and a max_iterations limit.
+        // Since we are using RoundRobin, the key (b"") is ignored.
+        // We look up to 256 times to find a healthy backend.
+        let upstream = self.0
+            .select(b"", 256) 
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        info!("Selected upstream: {:?}", upstream);
+
+        // 3. Construct the Peer
+        // We use the address provided by the Load Balancer.
+        // "upstream" is a generic SNI/Host since we are hitting simple echo servers.
+        let peer = Box::new(HttpPeer::new(
+            upstream, 
+            false, // No TLS for these specific echo containers
+            "upstream".to_string()
+        ));
+        
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Just for clarity in the logs
+        upstream_request.insert_header("Host", "round-robin-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 4. Initialize the Load Balancer
+    // We create a static list. In later modules, this can be dynamic.
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080", // Blue
+        "172.28.0.21:8080", // Green
+    ])?;
+
+    // 5. Create the Background Service
+    // This allows the LoadBalancer to run tasks (like health checks) in the background.
+    let background = background_service("round_robin_lb", upstreams);
+    
+    // Get the Arc pointer to the LB to pass to our proxy
+    let lb_ref = background.task();
+
+    // 6. Create the Proxy Service
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6170");
+
+    info!("Round Robin Load Balancer running on 0.0.0.0:6170");
+    
+    // 7. Register both services
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+    
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 26_round_robin
+```
+
+### 2. Observe the "Service Exited" Log
+
+You might see a log line saying `[INFO pingora_core::server] service exited`.
+**Do not panic.**
+
+* This refers to the `round_robin_lb` background service.
+* Because we haven't configured any **Health Checks** or **Dynamic Discovery** yet, the background service realized it had no periodic work to do and exited to save resources.
+* The Load Balancer state (the list of IPs) remains safely in memory, held by the Proxy Service.
+
+### 3. Send Traffic
+
+From another terminal, send two requests:
+
+```bash
+curl http://172.28.0.10:6170/
+curl http://172.28.0.10:6170/
+```
+
+### 4. Analyze Output
+
+You will see the responses alternate perfectly:
+
+```text
+'Response from BLUE'
+'Response from GREEN'
+```
+
+In the proxy logs, you will see the selection logic at work:
+
+```text
+[INFO] Selected upstream: Backend { addr: Inet(172.28.0.20:8080), ... }
+[INFO] Selected upstream: Backend { addr: Inet(172.28.0.21:8080), ... }
+```
