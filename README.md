@@ -3128,10 +3128,6 @@ docker exec -it pingora_client_1 curl -v http://172.28.0.10:6165/auth
 *Result:* `200 OK`.
 *Body:* `Response from mTLS Protected Upstream. Hello, Authenticated Client!`
 
-
-
-
-
 # Lesson 22: Proxy Connect (Tunneling)
 
 ## 1. Proxy Tunnels
@@ -3154,13 +3150,10 @@ Tunneling involves two distinct connection phases:
 
 1. **The Setup (Plaintext):**
    The client (Pingora) connects to the **Proxy** and sends a `CONNECT` request specifying the ultimate destination.
-```http
-CONNECT advanced.pingora.local:443 HTTP/1.1
-Host: advanced.pingora.local:443
-
-```
-
-
+   ```http
+   CONNECT advanced.pingora.local:443 HTTP/1.1
+   Host: advanced.pingora.local:443
+   ```
 2. **The Tunnel (Encrypted):**
    If allowed, the Proxy connects to the destination and replies `200 Connection Established`.
    At this precise moment, the connection transforms. The HTTP layer vanishes, and it becomes a raw TCP stream. Pingora then initiates the TLS handshake *through* this stream, effectively talking directly to the destination.
