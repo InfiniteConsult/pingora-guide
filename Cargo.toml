@@ -7,6 +7,8 @@ edition = "2024"
 pingora = { version = "0.6.0", features = ["openssl", "proxy", "lb", "cache"] }
 
 tokio = { version = "1.49.0", features = ["full"] }
+tokio-tungstenite = "0.28.0"
+futures-util = "0.3.31"
 async-trait = "0.1.89"
 bytes = "1.11.0"
 http = "1.4.0"
