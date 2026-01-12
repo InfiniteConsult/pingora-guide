@@ -5947,3 +5947,18 @@ curl -v -d "172.28.0.21:8080" http://127.0.0.1:9090/
 ```
 
 You have successfully built a control plane that allows you to reconfigure Pingora's routing logic in real-time without restarting the process.
+
+# Module 5: Traffic Control & Security
+
+We have built a proxy that routes, balances, and heals itself. But a production system must also **protect** itself.
+
+A proxy is the gateway to your infrastructure. If it allows every request through unchecked, your backend services will be overwhelmed by traffic spikes, abusive bots, or malicious attackers.
+
+In **Module 5**, we will implement the defensive layer of Pingora using the `pingora-limits` crate and custom filters. We will explore:
+
+* **Rate Limiting:** How to cap the number of requests a user can send per second (Fixed & Sliding Windows).
+* **Concurrency Control:** How to limit the number of active connections to a fragile backend to prevent it from crashing under load.
+* **Security Filtering:** How to block IPs at the TCP level and reject requests that are too large.
+* **Authentication:** How to validate Bearer tokens and Basic Auth headers *at the edge*, offloading this work from your microservices.
+
+By the end of this module, your proxy will not just be a router; it will be a shield.
