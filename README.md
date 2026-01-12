@@ -5415,3 +5415,243 @@ docker container start pingora-guide-upstream_blue-1
    [INFO] Backend ... becomes healthy
    [INFO] Primary (Blue) is healthy.
    ```
+
+# Lesson 34: Service Discovery (File-Based)
+
+In all previous lessons, we hardcoded IP addresses (e.g., `172.28.0.20:8080`) directly into the Rust source code. This is fine for a lab, but in production, servers change IP addresses, scale up, or scale down constantly. Recompiling and restarting the proxy every time an IP changes is not acceptable.
+
+**Service Discovery** allows Pingora to fetch the list of upstream servers from an external source (a file, an API, DNS, Consul, etc.) dynamically.
+
+In this lesson, we will implement **File-Based Discovery**:
+
+1. Pingora will read `conf/upstreams.txt`.
+2. It will populate the Load Balancer with the IPs found there.
+3. It will watch the file for changes. If you edit the file, Pingora updates its routing table **instantly** without a restart.
+
+## Key Concepts
+
+### 1. The `ServiceDiscovery` Trait
+
+This is the heart of dynamic routing in Pingora. It defines a single method: `discover()`.
+
+* **Input:** None.
+* **Output:** A list of `Backend` objects.
+* **Behavior:** The Load Balancer calls this method periodically (e.g., every 1 second). If the list returned is different from the current list, the Load Balancer performs an atomic swap.
+
+### 2. Hot Reloading (Atomic Swaps)
+
+When the discovery service returns a new list of backends, Pingora replaces the old list in memory.
+
+* **Existing connections** continue to finish on the old servers.
+* **New requests** immediately use the new list.
+* This ensures **Zero Downtime** during configuration changes.
+
+## The Code (`examples/34_service_discovery_file.rs`)
+
+Since Pingora provides the trait but leaves the specific implementation details flexible, we will implement a simple `FileDiscovery` struct that reads a file and parses IP addresses line-by-line.
+
+```rust
+use async_trait::async_trait;
+use log::{info, error};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+
+use pingora_load_balancing::{Backends, LoadBalancer, Backend};
+use pingora_load_balancing::discovery::ServiceDiscovery;
+use pingora_load_balancing::selection::RoundRobin;
+// We need the internal SocketAddr enum to construct Backends manually
+use pingora::protocols::l4::socket::SocketAddr;
+
+use std::sync::Arc;
+use std::time::Duration;
+use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap};
+use std::net::ToSocketAddrs;
+use http::Extensions;
+
+// 1. Define Custom Discovery Struct
+// This holds the configuration path state.
+pub struct FileDiscovery {
+    pub path: PathBuf,
+}
+
+// 2. Implement the ServiceDiscovery Trait
+// This is the contract Pingora uses to pull backend updates.
+#[async_trait]
+impl ServiceDiscovery for FileDiscovery {
+    async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+        // A. Read the file
+        let contents = match tokio::fs::read_to_string(&self.path).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to read upstream file: {}", e);
+                return Err(Error::explain(ErrorType::InternalError, e.to_string()))
+            },
+        };
+
+        // B. Parse Line-by-Line
+        let mut upstreams = BTreeSet::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with("#") {
+                continue;
+            }
+            
+            // C. Resolve Address
+            // Converts "1.2.3.4:80" into a SocketAddr
+            match line.to_socket_addrs() {
+                Ok(mut addrs) => {
+                    if let Some(addr) = addrs.next() {
+                        let backend = Backend {
+                            addr: SocketAddr::Inet(addr),
+                            weight: 1, 
+                            ext: Extensions::new()
+                        };
+                        upstreams.insert(backend);
+                    }
+                },
+                Err(e) => error!("Failed to parse address '{}': {}", line, e),
+            }
+        }
+        
+        // Return the new set of backends. 
+        // The second return value (HashMap) is for readiness/health overrides, which we leave empty.
+        Ok((upstreams, HashMap::new()))
+    }
+}
+
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // Selection: The LoadBalancer has the most recent list from the file
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        info!("Routed to upstream: {:?}", upstream);
+
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "file-discovery.cluster".to_string()
+        ));
+
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "file-discovery-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 1. Initialize Custom Discovery
+    let discovery = FileDiscovery {
+        path: PathBuf::from("conf/upstreams.txt"),
+    };
+
+    // 2. Setup Backends and LoadBalancer
+    // We wrap our discovery struct in the Backends container
+    let backends = Backends::new(Box::new(discovery));
+    let mut upstreams = LoadBalancer::from_backends(backends);
+    
+    // 3. Configure Update Frequency
+    // Critical: This tells Pingora to call discover() every 1 second.
+    upstreams.update_frequency = Some(Duration::from_secs(1));
+
+    // 4. Background Service
+    let background = background_service("file_discovery", upstreams);
+    let lb_ref = background.task();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6178");
+
+    info!("File-Based Discovery LB running on 0.0.0.0:6178");
+    info!("Watching file: conf/upstreams.txt");
+
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will start with one server, verify traffic, then edit the file on the fly to switch servers.
+
+### 1. Setup the Config File
+
+Create a `conf` directory if it doesn't exist, and add the **Blue** upstream.
+
+```bash
+mkdir -p conf
+echo "172.28.0.20:8080" > conf/upstreams.txt
+```
+
+### 2. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 34_service_discovery_file
+```
+
+### 3. Start Traffic (Terminal 2)
+
+```bash
+while true; do docker exec pingora_client_1 curl -s http://172.28.0.10:6178/; sleep 1; done
+```
+
+* **Output:** `Response from BLUE`
+* **Logs:** `Routed to upstream: ... 172.28.0.20:8080`
+
+### 4. Hot Reload (Terminal 3)
+
+While the curl loop is running, overwrite the file with the **Green** upstream.
+
+```bash
+echo "172.28.0.21:8080" > conf/upstreams.txt
+```
+
+### 5. Observe Results
+
+Within 1 second (our configured update frequency), you will see the traffic shift in the client terminal:
+
+```text
+'Response from BLUE'
+'Response from BLUE'
+'Response from GREEN'  <-- Automatic Switch
+'Response from GREEN'
+```
+
+And in the proxy logs:
+
+```text
+[INFO] Routed to upstream: Backend { addr: Inet(172.28.0.20:8080)... }
+[INFO] Routed to upstream: Backend { addr: Inet(172.28.0.21:8080)... }
+```
+
+This confirms that Pingora successfully discovered the new configuration and applied it dynamically.
