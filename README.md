@@ -4834,3 +4834,177 @@ docker container start pingora-guide-upstream_blue-1
 * **Client:** Traffic seamlessly resumes alternating between Blue and Green.
 
 This confirms that Pingora is actively managing the health of your upstream pool.
+
+# Lesson 31: HTTP Health Checks
+
+In the previous lesson, we used **TCP Health Checks** to verify that a server's port was open. However, "Port Open" does not mean "Application Working."
+
+A server can be:
+
+* **Deadlocked:** The process is running and accepting TCP connections, but stuck in an infinite loop.
+* **Overloaded:** It accepts connections but never responds.
+* **Broken:** It returns `500 Internal Server Error` for every request.
+
+A TCP check will pass in all these cases. An **HTTP Health Check** (Layer 7) solves this by sending a real request (e.g., `GET /`) and requiring a valid `200 OK` response.
+
+## Key Concepts
+
+### 1. Layer 4 vs. Layer 7 Checks
+
+* **Layer 4 (TCP):** "Is the phone line connected?" (Fast, cheap, catches crashes).
+* **Layer 7 (HTTP):** "Is the person answering the phone making sense?" (Slower, more expensive, catches application bugs).
+
+### 2. The `HttpHealthCheck`
+
+This struct performs the active probing.
+
+* **Request:** `GET /` (default, but customizable).
+* **Validation:** Requires status `200 OK` (default).
+* **Timeout:** If the server accepts the connection but doesn't send headers back within `read_timeout`, it is marked unhealthy.
+
+## The Code (`examples/31_health_check_http.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+
+use pingora_load_balancing::LoadBalancer;
+use pingora_load_balancing::selection::RoundRobin;
+use pingora_load_balancing::health_check::HttpHealthCheck;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Selection: Returns only endpoints responding 200 OK to probes
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "All upstreams are down"))?;
+
+        info!("Routed to upstream: {:?}", upstream);
+
+        let mut peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "http-health-check.cluster.local".to_string(),
+        ));
+
+        // Critical: Set timeouts on client traffic too.
+        // This ensures the client doesn't hang if the server dies between probes.
+        peer.options.read_timeout = Some(Duration::from_secs(1));
+        peer.options.connection_timeout = Some(Duration::from_secs(1));
+
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "http-health-check-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 1. Initialize Load Balancer
+    let mut upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    // 2. Configure HTTP Health Check
+    // "localhost" -> The Host header sent in the probe
+    // false -> No TLS (use HTTP)
+    let mut hc = Box::new(HttpHealthCheck::new("localhost", false));
+
+    // 3. Tuning
+    // Read timeout catches the "Hang": connection established, but no data returned.
+    hc.peer_template.options.read_timeout = Some(Duration::from_secs(1));
+    hc.peer_template.options.connection_timeout = Some(Duration::from_secs(1));
+    hc.consecutive_success = 1;
+    hc.consecutive_failure = 1;
+
+    // 4. Attach Check
+    // Note: HttpHealthCheck must be manually boxed here.
+    upstreams.set_health_check(hc);
+    
+    // Frequency: How often to probe (every 1s)
+    upstreams.health_check_frequency = Some(Duration::from_secs(1));
+    upstreams.parallel_health_check = true;
+
+    // 5. Background Service
+    let background = background_service("http_health_check_lb", upstreams);
+    let lb_ref = background.task();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6175");
+
+    info!("HTTP Health Check LB running on 0.0.0.0:6175");
+
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify the power of Layer 7 checks, we will simulate a "Frozen App."
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 31_health_check_http
+```
+
+### 2. Start Traffic
+
+```bash
+while true; do docker exec pingora_client_1 curl -s http://172.28.0.10:6175/; sleep 0.5; done
+```
+
+### 3. Freeze the App (Docker Pause)
+
+Instead of stopping the container (which closes the port), we `pause` it. This freezes the process in memory. The TCP stack (kernel) is still alive, so `telnet` would succeed, but the app cannot respond.
+
+```bash
+docker container pause pingora-guide-upstream_blue-1
+```
+
+### 4. Observe Reaction
+
+* **Logs:** `[WARN] Backend ... becomes unhealthy, ReadTimedout`.
+  * Pingora connected (TCP success), waited 1 second for headers, got nothing, and marked it dead.
+* **Traffic:** All traffic shifts to Green.
+
+### 5. Unfreeze
+
+```bash
+docker container unpause pingora-guide-upstream_blue-1
+```
+
+The app wakes up, answers the next probe, and re-enters rotation.
