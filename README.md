@@ -5237,3 +5237,181 @@ You should see 100% Blue responses.
 ```
 
 Green is returning `200 OK` (so a standard HTTP check would pass it), but our custom logic successfully filtered it out based on the content.
+
+# Lesson 33: Active-Passive Load Balancing (Failover)
+
+In standard load balancing (like Round Robin), all servers are "Active." Traffic is shared among them.
+
+**Active-Passive** routing is different. You have a **Primary** server (or pool) that handles 100% of the traffic. You also have a **Backup** server that sits idle, receiving zero traffic, until the Primary fails. This is common for disaster recovery setups or when the backup is a "Sorry Page" server hosted in a different region.
+
+## Key Concepts
+
+### 1. Pool Separation
+
+To achieve this in Pingora, we **do not** put the Backup server into the `LoadBalancer`.
+
+* If we put both Blue and Green in the `LoadBalancer`, Pingora would try to route traffic to both (Active-Active).
+* Instead, we put **only Blue** in the `LoadBalancer`. Green is defined manually in the code as a fallback.
+
+### 2. The Logic Flow
+
+We rely on the return value of `select()`:
+
+* **`Some(upstream)`:** The Primary is healthy. Use it.
+* **`None`:** The Primary is unhealthy (the pool is empty). Execute the fallback logic to route to the Backup.
+
+## The Code (`examples/33_active_passive_lb.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+// Import background service for running health checks
+use pingora::services::background::background_service;
+use pingora_load_balancing::LoadBalancer;
+use pingora_load_balancing::selection::RoundRobin;
+use pingora_load_balancing::health_check::TcpHealthCheck;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // 1. Attempt to select from the Primary Pool
+        let selection = self.0.select(b"", 256);
+        
+        match selection {
+            Some(upstream) => {
+                // HAPPY PATH: Primary is healthy
+                info!("Primary (Blue) is healthy. Routing to {:?}", upstream.addr);
+                let mut peer = Box::new(HttpPeer::new(
+                    upstream,
+                    false,
+                    "primary.cluster.local".to_string()
+                ));
+                // Important: Set timeouts to ensure we don't hang if the server dies mid-request
+                peer.options.read_timeout = Some(Duration::from_secs(1));
+                peer.options.connection_timeout = Some(Duration::from_secs(1));
+                Ok(peer)
+            }
+            None => {
+                // FAILURE PATH: Primary is down (Health Check removed it)
+                warn!("FAILOVER ALERT: Primary pool is empty! Switching to Backup (Green).");
+                
+                // Manually define the Backup IP
+                let backup_addr = ("172.28.0.21", 8080);
+                let peer = Box::new(HttpPeer::new(
+                    backup_addr,
+                    false,
+                    "backup.cluster.local".to_string()
+                ));
+                Ok(peer)
+            }
+        }
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "active-passive-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 2. Initialize Load Balancer with ONLY the Primary (Blue)
+    let mut upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080", 
+    ])?;
+
+    // 3. Configure Aggressive Health Check (Fail Fast)
+    let mut hc = TcpHealthCheck::new();
+    hc.peer_template.options.connection_timeout = Some(Duration::from_secs(1));
+    hc.consecutive_success = 1;
+    hc.consecutive_failure = 1;
+
+    upstreams.set_health_check(hc);
+    upstreams.health_check_frequency = Some(Duration::from_secs(1));
+    upstreams.parallel_health_check = true;
+
+    // 4. Background Service
+    let background = background_service("primary_pool_lb", upstreams);
+    let lb_ref = background.task();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6177");
+
+    info!("Active-Passive LB running on 0.0.0.0:6177");
+    info!("Primary: Blue (Checked). Backup: Green (Static Fallback).");
+
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify this, we will crash the Primary and watch the traffic automatically flow to the Backup.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 33_active_passive_lb
+```
+
+### 2. Start the Traffic Loop
+
+```bash
+while true; do docker exec pingora_client_1 curl -s http://172.28.0.10:6177/; sleep 1; done
+```
+
+* **Status:** `Response from BLUE`
+* **Logs:** `Primary (Blue) is healthy.`
+
+### 3. Kill the Primary (Blue)
+
+```bash
+docker container stop pingora-guide-upstream_blue-1
+```
+
+* **Status:** `Response from GREEN` (Immediate switch).
+* **Logs:**
+   ```text
+   [WARN] Backend ... becomes unhealthy
+   [WARN] FAILOVER ALERT: Primary pool is empty! Switching to Backup (Green).
+   ```
+
+### 4. Revive the Primary
+
+```bash
+docker container start pingora-guide-upstream_blue-1
+```
+
+* **Status:** `Response from BLUE` (Automatic recovery).
+* **Logs:**
+   ```text
+   [INFO] Backend ... becomes healthy
+   [INFO] Primary (Blue) is healthy.
+   ```
