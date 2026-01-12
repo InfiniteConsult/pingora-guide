@@ -5655,3 +5655,295 @@ And in the proxy logs:
 ```
 
 This confirms that Pingora successfully discovered the new configuration and applied it dynamically.
+
+# Lesson 35: Dynamic Reconfiguration (Hot-Swap API)
+
+In the previous lesson, we used **File-Based Discovery**, where Pingora "pulled" configuration changes by watching a file. While effective, modern cloud-native environments often prefer a **"Push" model**.
+
+In this lesson, we will implement an **Admin Control Plane**. We will run two separate services inside our Pingora process:
+
+1. **Proxy Service (Port 6179):** Handles standard user traffic.
+2. **Admin Service (Port 9090):** Listens for configuration commands.
+
+We will share state between them using a thread-safe lock (`RwLock`). When you send a POST request to the Admin Port, it updates the memory immediately, and the Proxy Service sees the change instantly.
+
+## Key Concepts
+
+### 1. Shared State (`Arc<RwLock<...>>`)
+
+To make two independent services talk to each other, we create a shared "Source of Truth" for the upstream list.
+
+* **`Arc`:** Allows multiple parts of the code to own the data.
+* **`RwLock`:** Allows multiple readers (the Load Balancer) to access data simultaneously, but ensures exclusive access for the writer (the Admin API) during updates.
+
+### 2. The Admin Service
+
+This is a `BackgroundService` that opens a TCP listener on port 9090. It parses incoming HTTP requests, extracts the new IP address from the body, and updates the shared state.
+
+### 3. In-Memory Discovery
+
+We implement a custom `ServiceDiscovery` struct. Instead of reading a file or querying DNS, its `discover()` method simply acquires a **Read Lock** on the shared state and returns a copy of the current list.
+
+## The Code (`examples/35_dynamic_reconfiguration.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::{info, error};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::server::ShutdownWatch;
+use pingora::upstreams::peer::HttpPeer;
+// We import BackgroundService to run our Admin API alongside the proxy
+use pingora::services::background::{background_service, BackgroundService};
+use pingora_load_balancing::{Backends, LoadBalancer, Backend};
+use pingora_load_balancing::discovery::ServiceDiscovery;
+use pingora_load_balancing::selection::RoundRobin;
+use pingora::protocols::l4::socket::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use std::collections::{BTreeSet, HashMap};
+use std::net::ToSocketAddrs;
+use tokio::sync::RwLock;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use http::Extensions;
+
+// 1. Shared State Container
+// This holds the "Source of Truth" for our upstreams.
+// - Wrapped in Arc for shared ownership across threads/tasks.
+// - Wrapped in RwLock for thread-safe access (Multiple Readers, One Writer).
+#[derive(Clone)]
+pub struct UpstreamState {
+    pub upstreams: Arc<RwLock<BTreeSet<Backend>>>,
+}
+
+// 2. In-Memory Discovery Strategy
+// This struct implements the ServiceDiscovery trait required by the LoadBalancer.
+// Instead of reading a file, it simply locks the shared memory and returns a copy.
+pub struct InMemoryDiscovery {
+    pub state: UpstreamState,
+}
+
+#[async_trait]
+impl ServiceDiscovery for InMemoryDiscovery {
+    async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+        // READ LOCK: Fast and non-blocking for concurrent readers
+        let guard = self.state.upstreams.read().await;
+        Ok((guard.clone(), HashMap::new()))
+    }
+}
+
+// 3. Admin API Service
+// This runs as a generic background service. It binds to port 9090 and
+// listens for configuration updates (POST requests).
+pub struct AdminApiService {
+    pub state: UpstreamState,
+}
+
+#[async_trait]
+impl BackgroundService for AdminApiService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let listener = TcpListener::bind("0.0.0.0:9090").await.expect("Failed to bind Admin Port 9090");
+        info!("Admin API listening on 0.0.0.0:9090");
+
+        loop {
+            // We use tokio::select! to handle incoming connections OR shutdown signals simultaneously.
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    info!("Admin API shutting down...");
+                    return;
+                }
+                res = listener.accept() => {
+                    match res {
+                        Ok((mut socket, addr)) => {
+                            info!("Admin connection from {}", addr);
+                            let state = self.state.clone();
+                            
+                            // Spawn a new lightweight task for each connection so we don't block the listener.
+                            tokio::spawn(async move {
+                                let mut buf = [0u8; 1024];
+                                let n = match socket.read(&mut buf).await {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return, // Connection closed
+                                };
+                                
+                                // Basic HTTP parsing (Demonstration purposes only)
+                                let req_str = String::from_utf8_lossy(&buf[..n]);
+                                
+                                // Extract body (everything after the double newline)
+                                let body = if let Some(idx) = req_str.find("\r\n\r\n") {
+                                    req_str[idx+4..].trim()
+                                } else {
+                                    req_str.trim()
+                                };
+
+                                if !body.is_empty() {
+                                    // Parse the IP address from the body
+                                    if let Ok(mut addrs) = body.to_socket_addrs() {
+                                        if let Some(new_addr) = addrs.next() {
+                                            // WRITE LOCK: Exclusive access to update the config
+                                            let mut guard = state.upstreams.write().await;
+                                            guard.clear();
+                                            guard.insert(Backend {
+                                                addr: SocketAddr::Inet(new_addr),
+                                                weight: 1,
+                                                ext: Extensions::new(),
+                                            });
+                                            info!("Admin: Hot-swapped upstream to {}", new_addr);
+                                            
+                                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                                        } else {
+                                            let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid IP").await;
+                                        }
+                                    } else {
+                                        error!("Admin: Failed to parse IP: {}", body);
+                                        let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nParse Error").await;
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => error!("Admin accept error: {}", e),
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // Selection: Uses the InMemoryDiscovery logic implicitly
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        info!("Routed to upstream: {:?}", upstream);
+
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "hot-swap.cluster".to_string()
+        ));
+
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "hot-swap-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // 1. Initialize Shared State (Default: Blue)
+    let initial_addr = "172.28.0.20:8080".to_socket_addrs()?.next().unwrap();
+    let mut initial_set = BTreeSet::new();
+    initial_set.insert(Backend {
+        addr: SocketAddr::Inet(initial_addr),
+        weight: 1,
+        ext: Extensions::new(),
+    });
+    
+    let state = UpstreamState {
+        upstreams: Arc::new(RwLock::new(initial_set)),
+    };
+
+    // 2. Setup Load Balancer with InMemoryDiscovery
+    // Pass a clone of the state so the LB can read from it
+    let discovery = InMemoryDiscovery { state: state.clone() };
+    let backends = Backends::new(Box::new(discovery));
+    let mut upstreams = LoadBalancer::from_backends(backends);
+    
+    // Update Frequency: Poll the shared memory state every 500ms
+    upstreams.update_frequency = Some(Duration::from_millis(500));
+
+    // 3. Register Services
+    
+    // A. LB Updater: Runs discover() periodically
+    let lb_service = background_service("lb_updater", upstreams);
+    let lb_ref = lb_service.task();
+
+    // B. Admin API: Listens on 9090 and updates state
+    let admin_task = AdminApiService { state: state.clone() };
+    let admin_service = background_service("admin_api", admin_task);
+
+    // C. Proxy: Listens on 6179 and serves traffic
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6179");
+
+    info!("Hot-Swap Proxy running on 0.0.0.0:6179");
+    info!("Admin API running on 0.0.0.0:9090");
+
+    my_server.add_service(lb_service);
+    my_server.add_service(admin_service);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+This verification requires us to act as both the **End User** (calling the proxy) and the **System Admin** (calling the admin port).
+
+### 1. Start the Server
+
+```bash
+RUST_LOG=info cargo run --example 35_dynamic_reconfiguration
+```
+
+* **Logs:** `Admin API listening on 0.0.0.0:9090` and `Hot-Swap Proxy running on 0.0.0.0:6179`.
+
+### 2. Generate Traffic (Terminal 2)
+
+The client will hit the proxy continuously.
+
+```bash
+while true; do docker exec pingora_client_1 curl -s http://172.28.0.10:6179/; sleep 1; done
+```
+
+* **Output:** `Response from BLUE`
+* **Logs:** `Routed to upstream: ... 172.28.0.20:8080`
+
+### 3. Perform Hot-Swap (Terminal 1 or 3)
+
+We will now use `curl` to send a POST request to the Admin API.
+**Important:** This command must be run **from the developer container** (where the server is running on localhost:9090), not from the client container.
+
+```bash
+# -d sends the new IP in the body
+curl -v -d "172.28.0.21:8080" http://127.0.0.1:9090/
+```
+
+### 4. Observe Results
+
+* **Admin Logs:** `Admin: Hot-swapped upstream to 172.28.0.21:8080`
+* **Traffic Output:**
+```text
+'Response from BLUE'
+'Response from GREEN'  <-- Instant switch
+'Response from GREEN'
+```
+
+You have successfully built a control plane that allows you to reconfigure Pingora's routing logic in real-time without restarting the process.
