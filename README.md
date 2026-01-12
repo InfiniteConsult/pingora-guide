@@ -5962,3 +5962,188 @@ In **Module 5**, we will implement the defensive layer of Pingora using the `pin
 * **Authentication:** How to validate Bearer tokens and Basic Auth headers *at the edge*, offloading this work from your microservices.
 
 By the end of this module, your proxy will not just be a router; it will be a shield.
+
+# Lesson 36: Basic Rate Limiting (Fixed Window)
+
+A proxy isn't just a router; it's a bouncer. Without limits, a single abusive client or a buggy script can overwhelm your backend services.
+
+In this lesson, we implement a **Fixed Window Rate Limiter**.
+
+* **The Rule:** A client IP can send max **5 requests** in a **1-second window**.
+* **The Consequence:** If they exceed this, the proxy rejects them immediately with `429 Too Many Requests`. The request never touches the upstream server.
+
+## Key Concepts
+
+### 1. The `request_filter` Hook
+
+Up until now, we have mostly focused on `upstream_peer`. However, for security logic, we need to intervene *before* we even select a server.
+The `request_filter` method in the `ProxyHttp` trait allows us to inspect the request and make a go/no-go decision.
+
+* **Return `Ok(false)`:** "Everything looks good, proceed to upstream."
+* **Return `Ok(true)`:** "Stop here. I have handled the response (e.g., sent an error)."
+
+### 2. The `pingora-limits` Crate
+
+Pingora provides a high-performance counting library called `pingora-limits`. It uses a "double-buffered" window implementation suitable for high-concurrency environments.
+
+* **`Rate` Struct:** The central counter.
+* **`observe(key, count)`:** Increments the counter for a specific key (IP address) and returns the *current* total for the active window.
+
+## The Code (`examples/36_basic_rate_limit.rs`)
+
+This code initializes a global rate limiter and checks every request's IP address against it.
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+// Import the specific Rate struct from the limits crate
+use pingora_limits::rate::Rate;
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use std::sync::Arc;
+use std::time::Duration;
+
+// 1. Global Rate Limiter State
+// We use `Lazy` to initialize the rate limiter globally.
+// The `Rate` struct manages the sliding windows internally.
+// We set the window duration to 1 second.
+static RATE_LIMITER: Lazy<Rate> = Lazy::new(|| { Rate::new(Duration::from_secs(1)) });
+
+// The Threshold: 5 requests per second per IP
+const MAX_REQ_PER_SEC: isize = 5;
+
+pub struct RateLimiterProxy(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for RateLimiterProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 2. The Upstream Selection (Standard Round Robin)
+    // This only runs if request_filter returns Ok(false).
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+        info!("Selected upstream: {:?}", upstream);
+        let peer = Box::new(HttpPeer::new(upstream, false, "rate-limited.cluster".to_string()));
+        Ok(peer)
+    }
+
+    // 3. The Security Filter (The Core Logic)
+    async fn request_filter(
+        &self, session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // IP Extraction Logic:
+        // Pingora's SocketAddr is an enum (Inet or Unix). We expect TCP connections here.
+        // We unwrap the Inet variant to get a hashable IP address.
+        let client_ip = match session.client_addr() {
+            Some(addr) => addr.as_inet().unwrap().ip(),
+            None => {
+                warn!("Could not determine client IP, allowing request.");
+                return Ok(false);
+            }
+        };
+
+        // 4. Observe and Check
+        // .observe() increments the counter for this IP and returns the *current* total.
+        let curr_req_count = RATE_LIMITER.observe(&client_ip, 1);
+
+        // 5. Enforcement
+        if curr_req_count > MAX_REQ_PER_SEC {
+            warn!("Rate Limit Exceeded for {}: {} req/s", client_ip, curr_req_count);
+            
+            // Return standard HTTP 429 response
+            session.respond_error(429).await?;
+            
+            // Critical: Return `true` to tell Pingora to STOP processing this request.
+            // The request will NOT be forwarded to the upstream_peer.
+            return Ok(true);
+        }
+        
+        // Return `false` to continue normal processing
+        Ok(false)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Standard Load Balancer setup (Blue/Green)
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, RateLimiterProxy(Arc::new(upstreams)));
+    my_proxy.add_tcp("0.0.0.0:6180");
+
+    info!("Rate Limiter Proxy running on 0.0.0.0:6180");
+    info!("Limit: {} requests per second per IP", MAX_REQ_PER_SEC);
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will confirm that the first 5 requests pass, and subsequent requests fail immediately.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 36_basic_rate_limit
+```
+
+### 2. Burst Traffic Test
+
+Run this loop in your client terminal to fire 10 requests rapidly:
+
+```bash
+docker exec -it pingora_client_1 bash -c 'for i in {1..10}; do curl -s -o /dev/null -w "%{http_code}\n" http://172.28.0.10:6180/; done'
+```
+
+### 3. Analyze Output
+
+You will see a clean cutoff:
+
+```text
+200  <- 1 (Allowed)
+200  <- 2 (Allowed)
+200  <- 3 (Allowed)
+200  <- 4 (Allowed)
+200  <- 5 (Allowed, bucket full)
+429  <- 6 (Blocked)
+429  <- 7 (Blocked)
+429  <- 8 (Blocked)
+429  <- 9 (Blocked)
+429  <- 10 (Blocked)
+```
+
+### 4. Check Proxy Logs
+
+The server logs confirm the interception logic works:
+
+```text
+[WARN] Rate Limit Exceeded for 172.28.0.30: 6 req/s
+[WARN] Rate Limit Exceeded for 172.28.0.30: 7 req/s
+...
+```
+
+Notice there are **no** `Selected upstream` logs for requests 6–10. The `request_filter` successfully short-circuited the pipeline.
