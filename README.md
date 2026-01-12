@@ -5008,3 +5008,232 @@ docker container unpause pingora-guide-upstream_blue-1
 ```
 
 The app wakes up, answers the next probe, and re-enters rotation.
+
+# Lesson 32: Custom Health Checks (Body Inspection)
+
+Standard HTTP health checks have a limitation: they typically only validate the **Status Code**. A server might return `200 OK` but serve an error page saying "Database Connection Failed."
+
+To catch these "zombie" servers, we need **Deep Inspection**. We must read the response body and verify that it matches a specific pattern.
+
+In this lesson, we enforce a strict business rule:
+
+* **Rule:** A server is healthy **only** if its response contains the string `"BLUE"`.
+* **Scenario:**
+* **Upstream Blue:** Returns "Response from BLUE" -> **Pass**.
+* **Upstream Green:** Returns "Response from GREEN" -> **Fail** (even though it returns 200 OK).
+
+## Key Concepts
+
+### 1. The `HealthCheck` Trait
+
+Pingora provides built-in `TcpHealthCheck` and `HttpHealthCheck`, but for custom logic, we implement the `HealthCheck` trait ourselves. This gives us complete control. We can:
+
+* Validate specific JSON fields.
+* Check cryptographic signatures.
+* Verify database connectivity.
+
+### 2. Manual Socket Handling
+
+Because we are bypassing the standard check, we must handle the networking manually.
+
+1. **Connect:** Open a TCP stream to the backend.
+2. **Write:** Send a raw HTTP request bytes (`GET / ...`).
+3. **Read:** Buffer the response.
+4. **Validate:** check if the buffer contains our target string.
+
+## The Code (`examples/32_custom_health_check.rs`)
+
+We define a struct `BodyMatchCheck` and implement the health check logic to scan the response body.
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::configuration::Opt;
+use pingora::server::Server;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::background::background_service;
+use pingora_load_balancing::{LoadBalancer, Backend};
+use pingora_load_balancing::selection::RoundRobin;
+use pingora_load_balancing::health_check::HealthCheck;
+use pingora::protocols::l4::socket::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// 1. Define Custom Health Check Struct
+pub struct BodyMatchCheck {
+    pub host: String,
+    pub expected_string: String,
+}
+
+// 2. Implement the HealthCheck Trait
+#[async_trait]
+impl HealthCheck for BodyMatchCheck {
+    async fn check(&self, target: &Backend) -> Result<()> {
+        // A. Extract Standard Socket Address
+        // Pingora uses a custom SocketAddr enum (Inet/Unix). We convert it for Tokio.
+        let addr = match &target.addr {
+            SocketAddr::Inet(addr) => *addr,
+            SocketAddr::Unix(_) => {
+                return Err(Error::explain(ErrorType::InternalError, "Custom check only supports TCP backends"));
+            }
+        };
+
+        // B. Connect (Fail Fast Timeout)
+        let mut stream = match tokio::time::timeout(
+            Duration::from_secs(1), 
+            TcpStream::connect(addr),
+        ).await {
+            Ok(Ok(s)) => s,
+            _ => return Err(Error::explain(ErrorType::ConnectTimedout, "Connection timed out")),
+        };
+
+        // C. Send Raw HTTP Request
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", 
+            self.host
+        );
+        if let Err(e) = stream.write_all(request.as_bytes()).await {
+             return Err(Error::explain(ErrorType::WriteError, e.to_string()));
+        }
+
+        // D. Read Response
+        let mut buffer = [0u8; 1024];
+        let n = match tokio::time::timeout(
+            Duration::from_secs(1), 
+            stream.read(&mut buffer),
+        ).await {
+            Ok(Ok(n)) => n,
+            _ => return Err(Error::explain(ErrorType::ReadTimedout, "Read timed out")),
+        };
+
+        // E. Validate Content
+        let response_text = String::from_utf8_lossy(&buffer[..n]);
+        if response_text.contains(&self.expected_string) {
+            Ok(())
+        } else {
+            warn!("Custom Check Failed for {:?}: Body did not contain '{}'", addr, self.expected_string);
+            Err(Error::explain(ErrorType::Custom("InvalidBody"), "Body validation failed"))
+        }
+    }
+
+    fn health_threshold(&self, _success: bool) -> usize { 
+        1 
+    }
+}
+
+pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for LB {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Selection: Automatically filters out nodes failing the custom check
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "All upstreams are down"))?;
+
+        info!("Routed to upstream: {:?}", upstream);
+
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            false,
+            "custom-check.cluster.local".to_string(),
+        ));
+        
+        Ok(peer)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "custom-check-cluster")?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let mut upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080", // Blue
+        "172.28.0.21:8080", // Green
+    ])?;
+
+    // Configure the Custom Check
+    let hc = BodyMatchCheck {
+        host: "localhost".to_string(),
+        expected_string: "BLUE".to_string(),
+    };
+
+    // Attach it (Boxing required)
+    upstreams.set_health_check(Box::new(hc));
+    upstreams.health_check_frequency = Some(Duration::from_secs(1));
+    upstreams.parallel_health_check = true;
+
+    let background = background_service("custom_health_check", upstreams);
+    let lb_ref = background.task();
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, LB(lb_ref));
+    my_proxy.add_tcp("0.0.0.0:6176");
+
+    info!("Custom Health Check LB running on 0.0.0.0:6176");
+
+    my_server.add_service(background);
+    my_server.add_service(my_proxy);
+
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify that **Upstream Green** is removed from the rotation because it fails the string match.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 32_custom_health_check
+```
+
+### 2. Observe the Logs
+
+Watch the logs immediately. You will see Pingora rejecting Green:
+
+```text
+[WARN] Custom Check Failed for 172.28.0.21:8080: Body did not contain 'BLUE'
+[WARN] Backend { ... } becomes unhealthy, InvalidBody context: Body validation failed
+```
+
+### 3. Verify Traffic
+
+Run a loop against the proxy.
+
+```bash
+while true; do docker exec pingora_client_1 curl -s http://172.28.0.10:6176/; sleep 0.5; done
+```
+
+**Expected Output:**
+You should see 100% Blue responses.
+
+```text
+'Response from BLUE'
+'Response from BLUE'
+'Response from BLUE'
+```
+
+Green is returning `200 OK` (so a standard HTTP check would pass it), but our custom logic successfully filtered it out based on the content.
