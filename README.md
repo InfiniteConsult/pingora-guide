@@ -6881,3 +6881,165 @@ curl -v -H "Transfer-Encoding: chunked" -d "$payload" http://172.28.0.10:6184/
 * **Logs:** `Rejecting request by Stream: Accumulated 150 bytes > 100`.
 
 This proves your proxy cannot be fooled by omitting the length header.
+
+# Lesson 41: Authentication (Bearer Token)
+
+One of the most powerful patterns in modern architecture is **Authentication Offloading** (or "Auth at the Edge").
+
+Instead of requiring every single microservice to implement token validation, logic handling, and error formatting, you enforce it once at the Proxy/Gateway level. If a request reaches your upstream service, that service can assume the user is already authenticated.
+
+In this lesson, we implement a simple API Gateway authentication check:
+
+* **No Header?** -> `401 Unauthorized`.
+* **Wrong Token?** -> `403 Forbidden`.
+* **Correct Token?** -> Allowed (`200 OK`).
+
+## Key Concepts
+
+### 1. HTTP 401 vs 403
+
+It is important to be semantically correct with HTTP errors:
+
+* **401 Unauthorized:** The user has not provided credentials. The client should prompt the user to log in.
+* **403 Forbidden:** The user provided credentials, but they are invalid or insufficient. Re-trying the same credentials will not work.
+
+### 2. Header Inspection
+
+We use `session.req_header().headers.get("Authorization")` to access the raw header value.
+
+* **Performance Tip:** We compare the value as **bytes** (`as_bytes()`) rather than converting it to a Rust `String` (`to_str()`). This avoids unnecessary memory allocation and UTF-8 validation overhead, which is crucial for high-throughput gateways.
+
+## The Code (`examples/41_auth_request.rs`)
+
+We enforce a hardcoded token `Bearer super-secret-token`. In a real app, you might validate a JWT signature or query a Redis cache here.
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use std::sync::Arc;
+
+// The shared secret (Hardcoded for this lesson)
+const SECRET_TOKEN: &[u8] = b"Bearer super-secret-token";
+
+pub struct AuthProxy(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for AuthProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 1. Authentication Logic
+    // Runs before upstream connection.
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Extract Authorization Header
+        let auth_header = session.req_header().headers.get("Authorization");
+
+        match auth_header {
+            // Case A: Header Missing -> 401 Unauthorized
+            None => {
+                warn!("Auth Failed: Missing Authorization header");
+                session.respond_error(401).await?;
+                return Ok(true); // Stop processing
+            }
+            // Case B: Header Present -> Check Token
+            Some(value) => {
+                // Direct byte comparison (fast)
+                if value.as_bytes() != SECRET_TOKEN {
+                    warn!("Auth Failed: Invalid Token");
+                    session.respond_error(403).await?;
+                    return Ok(true); // Stop processing
+                }
+            }
+        }
+
+        // Case C: Valid Token -> Allow
+        info!("Auth Success: Valid Token");
+        Ok(false) // Continue to upstream_peer
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        let peer = Box::new(HttpPeer::new(upstream, false, "auth-protected.cluster".to_string()));
+        Ok(peer)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, AuthProxy(Arc::new(upstreams)));
+    my_proxy.add_tcp("0.0.0.0:6185");
+
+    info!("Auth Proxy running on 0.0.0.0:6185");
+    info!("Required Token: Bearer super-secret-token");
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will cycle through the three authentication states to ensure strict enforcement.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 41_auth_request
+```
+
+### 2. Test A: Missing Header (401)
+
+```bash
+docker exec pingora_client_1 curl -v -o /dev/null http://172.28.0.10:6185/
+```
+
+* **Result:** `HTTP 401 Unauthorized`.
+* **Logs:** `[WARN] Auth Failed: Missing Authorization header`.
+
+### 3. Test B: Invalid Token (403)
+
+```bash
+docker exec pingora_client_1 curl -v -o /dev/null -H "Authorization: Bearer bad-token" http://172.28.0.10:6185/
+```
+
+* **Result:** `HTTP 403 Forbidden`.
+* **Logs:** `[WARN] Auth Failed: Invalid Token`.
+
+### 4. Test C: Valid Token (200)
+
+```bash
+docker exec pingora_client_1 curl -v -o /dev/null -H "Authorization: Bearer super-secret-token" http://172.28.0.10:6185/
+```
+
+* **Result:** `HTTP 200 OK`.
+* **Logs:** `[INFO] Auth Success: Valid Token`.
+
+The upstream service is now protected. No request reaches the backend unless it has the secret key.
