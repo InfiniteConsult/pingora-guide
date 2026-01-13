@@ -6147,3 +6147,168 @@ The server logs confirm the interception logic works:
 ```
 
 Notice there are **no** `Selected upstream` logs for requests 6–10. The `request_filter` successfully short-circuited the pipeline.
+
+# Lesson 37: Sliding Window Rate Limiting
+
+The **Fixed Window** approach (Lesson 36) has a flaw known as the "boundary burst." If the window resets at 1.0s, a user could send 5 requests at 0.9s and 5 requests at 1.1s. In a 0.2s span, they sent 10 requests, effectively doubling the allowed rate, yet the limiter sees two separate valid windows.
+
+To solve this, we use a **Sliding Window** (smoothed) limiter. This algorithm calculates the request rate as a weighted average over time, preventing boundary gaming and allowing for more "elastic" traffic handling.
+
+## Key Concepts
+
+### 1. `observe()` vs `rate()`
+
+When using Pingora's `pingora_limits::rate::Rate`:
+
+* **`observe(key, count)`:** This acts as the "writer." It increments the counter for the current time bucket. You **must** call this for every request.
+* **`rate(key)`:** This acts as the "reader." It returns an `f64` representing the smoothed requests per second. It looks at both the current bucket and the previous bucket to interpolate the actual velocity of traffic.
+
+### 2. The Logic Flow
+
+1. **Request arrives.**
+2. **Increment:** `observe(&ip, 1)` (Record the event).
+3. **Calculate:** `rate(&ip)` (Check the speed).
+4. **Decide:** If `rate > 5.0`, block.
+
+## The Code (`examples/37_sliding_window.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora_limits::rate::Rate;
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use std::sync::Arc;
+use std::time::Duration;
+
+// 1. Global Rate Limiter State
+// The Rate struct manages the sliding window logic (Red/Blue slots) internally.
+// A 1-second window allows us to calculate "Requests Per Second".
+static RATE_LIMITER: Lazy<Rate> = Lazy::new(|| { Rate::new(Duration::from_secs(1)) });
+
+// Threshold: 5.0 requests per second (Smoothed)
+const MAX_REQ_PER_SEC: f64 = 5.0;
+
+pub struct SlidingWindowProxy(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for SlidingWindowProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 2. The Security Filter
+    async fn request_filter(
+        &self, 
+        session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // IP Extraction Logic (Unwrap Inet address)
+        let client_ip = match session.client_addr() {
+            Some(addr) => addr.as_inet().unwrap().ip(),
+            None => {
+                warn!("Could not determine client IP, allowing request.");
+                return Ok(false);
+            }
+        };
+
+        // 3. Observe 
+        // Vital: We must increment the counter first.
+        // .observe() returns the raw count (isize), but we ignore it here.
+        RATE_LIMITER.observe(&client_ip, 1);
+
+        // 4. Check Rate
+        // .rate() returns the smoothed requests per second as an f64.
+        // This handles the interpolation between previous and current windows.
+        let current_rate = RATE_LIMITER.rate(&client_ip);
+
+        // 5. Enforcement
+        if current_rate > MAX_REQ_PER_SEC {
+            warn!("Rate Limit Exceeded for {}: {:.2} req/s (Limit: {:.1})", 
+                  client_ip, current_rate, MAX_REQ_PER_SEC);
+            
+            session.respond_error(429).await?;
+            return Ok(true); // Short-circuit
+        }
+
+        Ok(false)
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        let peer = Box::new(HttpPeer::new(upstream, false, "sliding-window.cluster".to_string()));
+        Ok(peer)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, SlidingWindowProxy(Arc::new(upstreams)));
+    my_proxy.add_tcp("0.0.0.0:6181");
+
+    info!("Sliding Window Rate Limiter running on 0.0.0.0:6181");
+    info!("Limit: {:.1} requests per second (Smoothed)", MAX_REQ_PER_SEC);
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify the "smoothing" effect, we will run two tests: one exactly at the limit, and one slightly over.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 37_sliding_window
+```
+
+### 2. Test A: Respecting the Limit (0.2s interval)
+
+Requests sent every 0.20s equal exactly 5 req/s. The smoothed limiter should allow this indefinitely.
+
+```bash
+docker exec -it pingora_client_1 bash -c 'for i in {1..15}; do curl -s -o /dev/null -w "%{http_code}\n" http://172.28.0.10:6181/; sleep 0.20; done'
+```
+
+* **Result:** 15 `200 OK` responses.
+
+### 3. Test B: Overload (0.15s interval)
+
+Requests sent every 0.15s equal ~6.6 req/s.
+
+```bash
+docker exec -it pingora_client_1 bash -c 'for i in {1..15}; do curl -s -o /dev/null -w "%{http_code}\n" http://172.28.0.10:6181/; sleep 0.15; done'
+```
+
+* **Result:** The first ~7 requests pass (burst allowance), but then the moving average crosses 5.0, and the rest return `429`.
+* **Logs:**
+```text
+[WARN] Rate Limit Exceeded for 172.28.0.30: 7.00 req/s (Limit: 5.0)
+```
+
+
+
+This confirms the limiter is successfully calculating velocity rather than just counting bucket hits.
