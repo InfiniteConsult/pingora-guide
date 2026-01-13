@@ -6501,3 +6501,169 @@ The logs confirm the rejection:
 ```
 
 This proves the proxy is actively protecting your backend from concurrency overload.
+
+# Lesson 39: IP Filtering (Access Control)
+
+In network security, one of the most basic but effective defenses is the Access Control List (ACL). You simply maintain a list of who is allowed in and who is not.
+
+While specialized firewalls (like `iptables` or AWS Security Groups) often handle this, doing it at the proxy level gives you finer control. You can log the attempts, return custom error pages, or dynamically update the blocklist without touching the OS kernel.
+
+In this lesson, we implement a simple **IP Blocklist**:
+
+* **Client 1 (`172.28.0.30`):** Allowed.
+* **Client 2 (`172.28.0.31`):** Blocked.
+
+## Key Concepts
+
+### 1. `request_filter` vs. `ConnectionFilter`
+
+* **`request_filter` (Layer 7):** This runs after the TCP handshake and TLS termination. We have access to the full HTTP request.
+* *Pros:* Can return a polite `403 Forbidden` HTML page. Can log detailed metadata (User-Agent, Path).
+* *Cons:* Slightly more resource-intensive as we parse the request first.
+* *Usage:* We use this today.
+
+
+* **`ConnectionFilter` (Layer 4):** This runs during the TCP handshake.
+* *Pros:* extremely fast. Drops the packet instantly.
+* *Cons:* The user sees a "Connection Reset" error, not a helpful HTTP message.
+* *Note:* While effective, the Layer 4 API in Pingora is advanced/experimental, so we will focus on Layer 7 filtering which is the standard for application proxies.
+
+
+
+### 2. Implementation Logic
+
+1. **Extract IP:** Get the IP from the session.
+2. **Match:** Check against our "Bad Actor" list.
+3. **Reject:** If matched, send `403` and return `Ok(true)` to stop processing.
+
+## The Code (`examples/39_connection_filter.rs`)
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use std::sync::Arc;
+
+pub struct FirewallProxy(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for FirewallProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 1. The Access Control Logic
+    // This hook runs immediately after the request headers are parsed.
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Extract Client IP
+        // We unwrap the Inet address to get a comparable IP object.
+        let client_ip = match session.client_addr() {
+            Some(addr) => addr.as_inet().unwrap().ip(),
+            None => {
+                warn!("Unknown client address, allowing...");
+                return Ok(false);
+            }
+        };
+
+        // 2. Define Blocklist
+        // In a production scenario, this would likely be an optimized
+        // Set (HashSet) or an IP CIDR matcher (IpNet).
+        let bad_actor_ip = "172.28.0.31".parse::<std::net::IpAddr>().unwrap();
+
+        // 3. Check and Block
+        if client_ip == bad_actor_ip {
+            warn!("Access Denied for IP: {}", client_ip);
+            
+            // Return 403 Forbidden
+            // This sends a standard error page to the client.
+            session.respond_error(403).await?;
+            
+            // Short-circuit: Return `true` to signal that the request 
+            // has been fully handled and should NOT proceed to the upstream.
+            return Ok(true);
+        }
+
+        // Allow legitimate traffic
+        Ok(false)
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        let peer = Box::new(HttpPeer::new(upstream, false, "firewall.cluster".to_string()));
+        Ok(peer)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, FirewallProxy(Arc::new(upstreams)));
+    my_proxy.add_tcp("0.0.0.0:6183");
+
+    info!("Firewall Proxy running on 0.0.0.0:6183");
+    info!("Blocking Bad Actor: 172.28.0.31");
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will confirm that Client 1 is allowed and Client 2 is blocked.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 39_connection_filter
+```
+
+### 2. Test Client 1 (Allowed)
+
+Run this command from your host machine (assuming the docker setup):
+
+```bash
+docker exec -it pingora_client_1 curl -v http://172.28.0.10:6183/
+```
+
+* **Result:** `HTTP/1.1 200 OK`
+* **Log:** No warnings. Normal routing.
+
+### 3. Test Client 2 (Blocked)
+
+```bash
+docker exec -it pingora_client_2 curl -v http://172.28.0.10:6183/
+```
+
+* **Result:** `HTTP/1.1 403 Forbidden`
+* **Log:**
+   ```text
+   [WARN] Access Denied for IP: 172.28.0.31
+   ```
+
+This confirms the IP filter is actively protecting your service.
