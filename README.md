@@ -6528,8 +6528,6 @@ In this lesson, we implement a simple **IP Blocklist**:
 * *Cons:* The user sees a "Connection Reset" error, not a helpful HTTP message.
 * *Note:* While effective, the Layer 4 API in Pingora is advanced/experimental, so we will focus on Layer 7 filtering which is the standard for application proxies.
 
-
-
 ### 2. Implementation Logic
 
 1. **Extract IP:** Get the IP from the session.
@@ -6667,3 +6665,219 @@ docker exec -it pingora_client_2 curl -v http://172.28.0.10:6183/
    ```
 
 This confirms the IP filter is actively protecting your service.
+
+# Lesson 40: Request Size Limiting
+
+Handling large file uploads is resource-intensive. If a client starts uploading a 10GB video to an endpoint meant for 1KB JSON payloads, your server waits, buffers, and eventually crashes or runs out of bandwidth.
+
+Pingora allows us to enforce limits at the edge. While `pingora-web` (the higher-level framework) has global settings for this, implementing it manually in `pingora-proxy` gives us fine-grained control—for example, allowing 500MB on `/upload` but only 2KB on `/login`.
+
+In this lesson, we implement a **Dual-Layer Defense**:
+
+1. **Fast Path:** Check the `Content-Length` header. If it says "1GB", reject immediately.
+2. **Slow Path:** If the client lies or uses `Transfer-Encoding: chunked` (no total size declared), we count the bytes as they stream in and cut the connection if they exceed the limit.
+
+## Key Concepts
+
+### 1. `request_body_filter`
+
+This is a new hook in the `ProxyHttp` trait. It runs *for every chunk* of data received from the client.
+
+* **Input:** `body: &mut Option<Bytes>`.
+* **Action:** We inspect the size, increment a counter in our `CTX`, and decide whether to allow it or return an error.
+
+### 2. `fail_to_proxy`
+
+If `request_body_filter` returns an error, Pingora aborts the upstream connection. However, by default, it might just close the socket or send a 502. To send a proper `413 Payload Too Large` to the client, we must implement the `fail_to_proxy` hook to catch our specific error and format the response.
+
+## The Code (`examples/40_request_size_limit.rs`)
+
+We set an artificially low limit of **100 bytes** to make testing easy.
+
+```rust
+use async_trait::async_trait;
+use bytes::Bytes;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::proxy::FailToProxy;
+use http::header::CONTENT_LENGTH;
+
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use std::sync::Arc;
+
+// Max 100 bytes (Artificially low for testing)
+const MAX_BODY_SIZE: usize = 100;
+
+// 1. Context to track streaming body size
+// This persists across multiple calls to request_body_filter
+pub struct SizeCtx {
+    pub bytes_read: usize,
+}
+
+pub struct SizeLimitProxy(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for SizeLimitProxy {
+    type CTX = SizeCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        SizeCtx { bytes_read: 0 }
+    }
+
+    // 2. Filter 1: Check Content-Length Header
+    // This catches large requests EARLY, before we accept the body payload.
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(value) = session.req_header().headers.get(CONTENT_LENGTH) {
+            if let Ok(len_str) = value.to_str() {
+                if let Ok(len) = len_str.parse::<usize>() {
+                    if len > MAX_BODY_SIZE {
+                        warn!("Rejecting request by Header: Content-Length: {} > {}", len, MAX_BODY_SIZE);
+                        session.respond_error(413).await?;
+                        return Ok(true); // Short-circuit
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    // 3. Filter 2: Check Streaming Body
+    // This catches "Transfer-Encoding: chunked" or lying Content-Length headers.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(b) = body {
+            ctx.bytes_read += b.len();
+            if ctx.bytes_read > MAX_BODY_SIZE {
+                warn!("Rejecting request by Stream: Accumulated {} bytes > {}", ctx.bytes_read, MAX_BODY_SIZE);
+                // We return a Custom error here. Standard errors would cause a 502.
+                // We need `fail_to_proxy` to convert this into a 413.
+                return Err(Error::explain(ErrorType::Custom("BodyTooLarge"), "Stream exceeded limit"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        let peer = Box::new(HttpPeer::new(upstream, false, "size-limit.cluster".to_string()));
+        Ok(peer)
+    }
+
+    // 4. Handle Streaming Errors
+    // If request_body_filter raises an error, it ends up here.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX
+    ) -> FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Convert our custom error into a proper HTTP 413 response
+        if let ErrorType::Custom("BodyTooLarge") = e.etype {
+            let _ = session.respond_error(413).await;
+            return FailToProxy {
+                error_code: 413,
+                can_reuse_downstream: false,
+            };
+        }
+        
+        FailToProxy {
+            error_code: 502,
+            can_reuse_downstream: false,
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, SizeLimitProxy(Arc::new(upstreams)));
+    my_proxy.add_tcp("0.0.0.0:6184");
+
+    info!("Request Size Limiter running on 0.0.0.0:6184");
+    info!("Max Body Size: {} bytes", MAX_BODY_SIZE);
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify both the fast header check and the slow streaming check.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 40_request_size_limit
+```
+
+### 2. Valid Request
+
+Send "tiny" (4 bytes).
+
+```bash
+curl -v -d "tiny" http://172.28.0.10:6184/
+```
+
+* **Result:** `200 OK`.
+
+### 3. Header Rejection (Fast Path)
+
+We create a ~150 byte payload. `curl` automatically adds the `Content-Length: 150` header.
+
+```bash
+# Generate 150 'a' characters
+payload=$(printf 'a%.0s' {1..150})
+curl -v -d "$payload" http://172.28.0.10:6184/
+```
+
+* **Result:** `413 Payload Too Large` (Immediate).
+* **Logs:** `Rejecting request by Header: Content-Length: 150 > 100`.
+
+### 4. Streaming Rejection (Slow Path)
+
+We force `chunked` encoding so `curl` does *not* send a `Content-Length`. Pingora must read the body to find the size.
+
+```bash
+curl -v -H "Transfer-Encoding: chunked" -d "$payload" http://172.28.0.10:6184/
+```
+
+* **Result:** `413 Payload Too Large` (After uploading).
+* **Logs:** `Rejecting request by Stream: Accumulated 150 bytes > 100`.
+
+This proves your proxy cannot be fooled by omitting the length header.
