@@ -6309,6 +6309,195 @@ docker exec -it pingora_client_1 bash -c 'for i in {1..15}; do curl -s -o /dev/n
 [WARN] Rate Limit Exceeded for 172.28.0.30: 7.00 req/s (Limit: 5.0)
 ```
 
-
-
 This confirms the limiter is successfully calculating velocity rather than just counting bucket hits.
+
+# Lesson 38: In-flight Concurrency Limiting
+
+**Rate Limiting** (Lessons 36-37) controls *how often* a user can knock on your door.
+**In-flight Limiting** controls *how many* people can be inside the house at once.
+
+This distinction is vital. A heavy API endpoint (e.g., "Generate PDF Report") might take 5 seconds to process. Even if a user only sends 1 request every 5 seconds (low rate), if 100 users do it simultaneously, you have 100 active threads, which could crash your database.
+
+In this lesson, we implement a **Concurrency Limiter**.
+
+* **Rule:** Max **2 simultaneous requests** allowed globally.
+* **Result:** The 3rd simultaneous request gets rejected immediately with `429 Too Many Requests`.
+
+## Key Concepts
+
+### 1. The `Inflight` Struct and `Guard`
+
+The `pingora-limits` crate uses a semaphore-like pattern.
+
+* `incr(key)`: Increments the counter and returns a `Guard`.
+* `Guard`: This is a "ticket." As long as this object exists in memory, the "slot" is occupied.
+* **Automatic Cleanup:** When the `Guard` is dropped (goes out of scope), the counter is automatically decremented.
+
+### 2. The Context (`CTX`) Bridge
+
+Since a request takes time to complete, we need to hold onto the `Guard` from the beginning of the request until the end.
+We define a custom Context struct (`InflightCtx`) to store this guard.
+
+* **Request Start (`request_filter`):** We acquire the guard and move it into `ctx.guard`.
+* **Request End:** Pingora drops the `ctx`, which drops the `guard`, which frees the slot.
+
+## The Code (`examples/38_inflight_limit.rs`)
+
+We intentionally add a **2-second sleep** in `upstream_peer` to simulate a slow backend. This ensures requests overlap in time so we can verify the limit.
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+
+use pingora_limits::inflight::{Inflight, Guard};
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use std::sync::Arc;
+use std::time::Duration;
+
+// 1. Global In-flight Limiter State
+// Counts active connections. Does not rely on time windows.
+static INFLIGHT_LIMITER: Lazy<Inflight> = Lazy::new(|| Inflight::new());
+
+// Limit: Max 2 simultaneous requests
+const MAX_CONCURRENT_REQ: isize = 2;
+
+// 2. The Context
+// This struct holds the "ticket" (Guard) for the duration of the request.
+pub struct InflightCtx {
+    pub guard: Option<Guard>,
+}
+
+pub struct InflightLimitProxy(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for InflightLimitProxy {
+    type CTX = InflightCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        InflightCtx { guard: None }
+    }
+
+    // 3. The Security Filter
+    async fn request_filter(
+        &self, 
+        session: &mut Session,
+        ctx: &mut Self::CTX
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Define the scope of the limit (Global vs Per-IP)
+        let key = "global_limit";
+
+        // Increment the counter. Returns the guard and the *new* count.
+        let (guard, count) = INFLIGHT_LIMITER.incr(key, 1);
+
+        // 4. Check Limit
+        if count > MAX_CONCURRENT_REQ {
+            warn!("In-flight Limit Exceeded {}/{}", count, MAX_CONCURRENT_REQ);
+            
+            session.respond_error(429).await?;
+            
+            // CRITICAL: We do NOT put the guard into 'ctx'.
+            // When this function returns, 'guard' goes out of scope here.
+            // Rust calls drop(guard), which decrements the counter immediately.
+            return Ok(true);
+        }
+
+        // 5. Acquire Slot
+        // Move the guard into the context. It will stay there until the 
+        // request completes (success or failure).
+        ctx.guard = Some(guard);
+
+        Ok(false)
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        // SIMULATION: Artificial 2s delay.
+        // This forces requests to overlap in time, triggering the concurrency limit.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let peer = Box::new(HttpPeer::new(upstream, false, "inflight.cluster".to_string()));
+        Ok(peer)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, InflightLimitProxy(Arc::new(upstreams)));
+    my_proxy.add_tcp("0.0.0.0:6182");
+
+    info!("In-flight Limiter running on 0.0.0.0:6182");
+    info!("Max Concurrent Requests: {}", MAX_CONCURRENT_REQ);
+    info!("Note: Upstream connection has artificial 2s delay to simulate load.");
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+To verify this, we need to send requests faster than the server can finish them (which is easy, because the server takes 2 seconds).
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 38_inflight_limit
+```
+
+### 2. Run Parallel Requests
+
+We use a bash loop to fire 5 requests simultaneously into the background (`&`) and then wait for them all to finish.
+
+```bash
+docker exec -it pingora_client_1 bash -c 'for i in {1..5}; do curl -s -o /dev/null -w "%{http_code}\n" http://172.28.0.10:6182/ & done; wait'
+```
+
+### 3. Analyze Output
+
+You should see a mix of `200` and `429`:
+
+```text
+429
+429
+429
+200
+200
+```
+
+* **200s:** Two requests grabbed the slots and slept for 2 seconds.
+* **429s:** Three requests arrived, saw the limit `3/2` (or `4/2`, `5/2`), and were rejected instantly.
+
+### 4. Check Logs
+
+The logs confirm the rejection:
+
+```text
+[WARN] In-flight Limit Exceeded 3/2
+[WARN] In-flight Limit Exceeded 3/2
+[WARN] In-flight Limit Exceeded 3/2
+```
+
+This proves the proxy is actively protecting your backend from concurrency overload.
