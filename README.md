@@ -7777,3 +7777,214 @@ docker exec pingora_client_1 curl -s http://172.28.0.10:6192/long
 * **Log:** `MISS` -> `HIT` (because 6s < 60s).
 
 This confirms the proxy is correctly parsing and enforcing the upstream's caching policies.
+
+# Lesson 45: Cache Locking (Request Coalescing)
+
+Imagine you are running a news site. A major story breaks. 1,000 users click the link at the exact same millisecond. The story is not in your cache yet.
+
+Without protection, your proxy sends **1,000 requests** to your database simultaneously. Your database crashes. This is called the **Thundering Herd** problem (or "Cache Stampede").
+
+**Cache Locking** (Request Coalescing) solves this.
+
+1. **Request 1 arrives:** The proxy sees a cache miss. It acquires a "Write Lock" on the URL. It contacts the backend.
+2. **Requests 2-1000 arrive:** The proxy sees a cache miss *but* sees the lock is held. These requests **wait** (sleep) at the proxy layer.
+3. **Request 1 returns:** The response is stored in the cache. The lock is released.
+4. **Requests 2-1000 wake up:** They instantly find the fresh data in the cache and return.
+
+Result: **1 backend request.** 1,000 happy users.
+
+## Key Concepts
+
+### 1. `CacheLock`
+
+Pingora provides `pingora_cache::lock::CacheLock`.
+
+* It is a concurrent hash table of semaphores.
+* **Writer:** The thread fetching from upstream.
+* **Reader:** The threads waiting for the writer.
+
+### 2. Enabling the Lock
+
+We pass the lock instance to `session.cache.enable()`. It is the 4th argument.
+
+```rust
+session.cache.enable(&*MEM_CACHE, None, None, Some(&*CACHE_LOCK), None);
+```
+
+### 3. Observable Metrics
+
+Pingora tracks how long a request waited for a lock. We can log this using `session.cache.lock_duration()`.
+
+* **Writer:** Wait time is `0ns`.
+* **Reader:** Wait time is roughly equal to the upstream response time.
+
+## The Code (`examples/45_cache_lock.rs`)
+
+We simulate a "Heavy" upstream that sleeps for **2 seconds** before responding. This allows us to manually fire multiple requests during that window and watch them coalesce.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::http::ResponseHeader;
+
+use pingora_cache::{MemCache, CacheKey, CacheMetaDefaults, RespCacheable, CachePhase};
+use pingora_cache::cache_control::CacheControl;
+use pingora_cache::lock::CacheLock;
+
+use std::borrow::Cow;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// 1. Initialize Global Lock Manager
+static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+static CACHE_LOCK: Lazy<CacheLock> = Lazy::new(|| CacheLock::new(Duration::from_secs(5)));
+
+pub struct CacheLockProxy;
+
+#[async_trait]
+impl ProxyHttp for CacheLockProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 2. Enable Caching WITH Locking
+    fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        let key = CacheKey::new("", session.req_header().uri.path(), "");
+        session.cache.enable(
+            &*MEM_CACHE,
+            None,
+            None,
+            Some(&*CACHE_LOCK), // Pass the lock here
+            None
+        );
+        session.cache.set_cache_key(key);
+        Ok(())
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let peer = Box::new(HttpPeer::new(("127.0.0.1", 6195), false, "heavy.local".to_string()));
+        Ok(peer)
+    }
+
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<RespCacheable> {
+        let cc = CacheControl::from_resp_headers(resp);
+        let defaults = CacheMetaDefaults::new(|_| None, 0, 0);
+        Ok(pingora_cache::filters::resp_cacheable(cc.as_ref(), resp.clone(), false, &defaults))
+    }
+
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        // 3. Log Who was Writer and Who was Reader
+        let status = match session.cache.phase() {
+            CachePhase::Hit => "HIT (READER)",
+            CachePhase::Miss => "MISS (WRITER)",
+            _ => "OTHER"
+        };
+
+        let wait_time = session.cache.lock_duration().unwrap_or(Duration::ZERO);
+        info!(
+            "Client Finished. Status: {}. Waited for lock: {:?}",
+            status,
+            wait_time
+        );
+    }
+}
+
+// 4. Heavy Mock Upstream
+async fn run_slow_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:6195").await.unwrap();
+    info!("Slow Upstream running on 127.0.0.1:6195");
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                
+                // Simulate heavy work
+                info!(">> Processing expensive request (2s delay)...");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                let body = "Expensive Content Generated";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Cache-Control: public, max-age=60\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    {}",
+                    body.len(),
+                    body
+                );
+
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    pingora_cache::set_compression_dict_content(Cow::Borrowed(b""));
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_slow_upstream());
+    });
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, CacheLockProxy);
+    my_proxy.add_tcp("0.0.0.0:6194");
+
+    info!("Cache Lock Proxy running on 0.0.0.0:6194");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will simulate a mini "Thundering Herd" using a bash loop.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 45_cache_lock
+```
+
+### 2. Fire Concurrent Requests
+
+Run this command to spawn 5 requests in the background simultaneously.
+
+```bash
+for i in {1..5}; do 
+  docker exec pingora_client_1 curl -s http://172.28.0.10:6194/resource &
+done; wait
+```
+
+### 3. Observe the Logs
+
+* **Upstream:** You will see `>> Processing expensive request` exactly **once**.
+* **Proxy:**
+  * 1 log entry: `Status: MISS (WRITER). Waited for lock: 0ns`.
+  * 4 log entries: `Status: HIT (READER). Waited for lock: 2.00s`.
+
+This confirms the lock worked perfectly. The backend was protected, and all clients got the correct data.
