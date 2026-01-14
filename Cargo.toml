@@ -7,6 +7,7 @@ edition = "2024"
 pingora = { version = "0.6.0", features = ["openssl", "proxy", "lb", "cache"] }
 pingora-load-balancing = { version = "0.6.0", features = ["openssl"]}
 pingora-limits = { version = "0.6.0"}
+pingora-cache = { version = "0.6.0" }
 
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-tungstenite = "0.28.0"

@@ -1402,6 +1402,7 @@ dependencies = [
  "log",
  "once_cell",
  "pingora",
+ "pingora-cache",
  "pingora-limits",
  "pingora-load-balancing",
  "serde",
