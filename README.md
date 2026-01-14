@@ -7549,3 +7549,231 @@ This `&*` pattern is a Rust idiom used to satisfy type coercion and lifetime req
    If you tried to pass `&MEM_CACHE`, you would be passing a reference to the wrapper itself (`&Lazy<MemCache>`). The `Lazy` struct does *not* implement the `Storage` trait; only the inner `MemCache` does. Therefore, you must manually peel off the wrapper (`*`) and then reference the inner object (`&`).
    
 **Summary:** `&*MEM_CACHE` translates to: "Give me a reference to the *actual initialized cache* inside the global wrapper."
+
+# Lesson 44: Respecting Cache-Control Headers
+
+In Lesson 43, we manually forced the proxy to cache everything for 60 seconds. While useful for testing, a production proxy should never do this. It should respect the **origin server's** instructions.
+
+If an upstream server sends `Cache-Control: no-store` (e.g., banking data) or `max-age=5` (e.g., stock tickers), the proxy must obey. Pingora provides built-in parsers to handle strict RFC compliance out of the box.
+
+In this lesson, we implement a **Smart Caching Proxy** that adapts its behavior based on the URL:
+
+* `/short` -> Cache for 5 seconds.
+* `/long` -> Cache for 60 seconds.
+* `/no_store` -> Do not cache at all.
+
+## Key Concepts
+
+### 1. The `Cache-Control` Header
+
+This is the standard mechanism for web caching.
+
+* `max-age=N`: The content is fresh for N seconds.
+* `no-store`: The content must **never** be stored in non-volatile storage.
+* `private`: The content is for a specific user (e.g., a profile page) and should not be stored by a shared proxy.
+
+### 2. RFC Compliance via `resp_cacheable`
+
+Pingora provides a helper function `pingora_cache::filters::resp_cacheable`.
+Instead of writing complex `if` statements (e.g., "if header contains 'no-store'..."), you pass the parsed headers to this function. It returns:
+
+* `RespCacheable::Cacheable(meta)`: If valid, with the calculated TTL.
+* `RespCacheable::Uncacheable(reason)`: If invalid (e.g., `origin_no_store`, `response_too_large`).
+
+## The Code (`examples/44_cache_control.rs`)
+
+We update our mock upstream to be "dynamic"—it reads the request path and changes the response headers accordingly.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::http::ResponseHeader;
+
+use pingora_cache::{MemCache, CacheKey, CacheMetaDefaults, RespCacheable, CachePhase};
+use pingora_cache::cache_control::CacheControl;
+use std::borrow::Cow;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+
+pub struct CacheControlProxy;
+
+#[async_trait]
+impl ProxyHttp for CacheControlProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 1. Setup Storage
+    fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        let key = CacheKey::new("", session.req_header().uri.path(), "");
+        session.cache.enable(&*MEM_CACHE, None, None, None, None);
+        session.cache.set_cache_key(key);
+        Ok(())
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Connect to our dynamic mock upstream
+        let peer = Box::new(HttpPeer::new(("127.0.0.1", 6193), false, "header.test.local".to_string()));
+        Ok(peer)
+    }
+
+    // 2. The Decision Logic
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<RespCacheable> {
+        // Parse headers using Pingora's built-in parser
+        let cc = CacheControl::from_resp_headers(resp);
+        
+        // Define empty defaults (Cache nothing if headers are missing)
+        let defaults = CacheMetaDefaults::new(|_| None, 0, 0);
+        
+        // Let Pingora decide based on RFC rules
+        Ok(pingora_cache::filters::resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            false,
+            &defaults
+        ))
+    }
+
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        let path = session.req_header().uri.path();
+        match session.cache.phase() {
+            CachePhase::Hit => info!("Path {}, Status: HIT", path),
+            CachePhase::Miss => info!("Path {}, Status: MISS", path),
+            CachePhase::Expired => info!("Path {}, Status: EXPIRED", path),
+            CachePhase::Disabled(_) => info!("Path {}, Status: SKIP (Uncacheable)", path),
+            _ => {}
+        }
+    }
+}
+
+// 3. Dynamic Mock Upstream
+// Returns different Cache-Control headers based on the request URL.
+async fn run_dynamic_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:6193").await.unwrap();
+    info!("Dynamic Upstream running on 127.0.0.1:6193");
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+
+                // Determine Header based on Path
+                let cc_header = if req.contains("GET /short") {
+                    "max-age=5"
+                } else if req.contains("GET /long") {
+                    "max-age=60"
+                } else if req.contains("GET /no_store") {
+                    "no-store"
+                } else {
+                    "max-age=10"
+                };
+
+                let body = format!("Content for {}", cc_header);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Cache-Control: {}\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    {}\n",
+                    body.len() + 1,
+                    cc_header,
+                    body
+                );
+
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    pingora_cache::set_compression_dict_content(Cow::Borrowed(b""));
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_dynamic_upstream());
+    });
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, CacheControlProxy);
+    my_proxy.add_tcp("0.0.0.0:6192");
+
+    info!("Cache Control Proxy running on 0.0.0.0:6192");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify that Pingora adapts its caching strategy dynamically.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 44_cache_control
+```
+
+### 2. Test A: `no-store` (Security Check)
+
+```bash
+docker exec pingora_client_1 curl -s http://172.28.0.10:6192/no_store
+docker exec pingora_client_1 curl -s http://172.28.0.10:6192/no_store
+```
+
+* **Result:** Both requests are fetched from the upstream.
+* **Log:** `Path /no_store, Status: SKIP (Uncacheable)`
+
+### 3. Test B: `max-age=5` (Short Lived)
+
+```bash
+# Request 1 (Miss)
+docker exec pingora_client_1 curl -s http://172.28.0.10:6192/short
+# Request 2 (Hit) - Immediate
+docker exec pingora_client_1 curl -s http://172.28.0.10:6192/short
+# Wait 6 seconds...
+sleep 6
+# Request 3 (Expired)
+docker exec pingora_client_1 curl -s http://172.28.0.10:6192/short
+```
+
+* **Log:** `MISS` -> `HIT` -> `EXPIRED` (because 6s > 5s).
+
+### 4. Test C: `max-age=60` (Long Lived)
+
+```bash
+# Request 1 (Miss)
+docker exec pingora_client_1 curl -s http://172.28.0.10:6192/long
+# Wait 6 seconds...
+sleep 6
+# Request 2 (Hit)
+docker exec pingora_client_1 curl -s http://172.28.0.10:6192/long
+```
+
+* **Log:** `MISS` -> `HIT` (because 6s < 60s).
+
+This confirms the proxy is correctly parsing and enforcing the upstream's caching policies.
