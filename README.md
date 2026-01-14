@@ -7043,3 +7043,183 @@ docker exec pingora_client_1 curl -v -o /dev/null -H "Authorization: Bearer supe
 * **Logs:** `[INFO] Auth Success: Valid Token`.
 
 The upstream service is now protected. No request reaches the backend unless it has the secret key.
+
+# Lesson 42: Basic Authentication
+
+In Lesson 41, we implemented Bearer Token authentication, where the client is expected to know the secret beforehand.
+
+**Basic Authentication** follows a different flow called "Challenge-Response." If a user visits your site without credentials, the server must **challenge** them to provide a username and password. This is what triggers the native login popup in web browsers.
+
+In this lesson, we implement this flow:
+
+1. **Challenge:** If the request has no credentials, return `401 Unauthorized` **AND** a `WWW-Authenticate` header.
+2. **Verify:** If the request returns with credentials, valid them against our stored user (`admin:password`).
+
+## Key Concepts
+
+### 1. The `WWW-Authenticate` Header
+
+Simply returning `401` isn't enough. Without the `WWW-Authenticate` header, a browser will simply display a generic error page.
+
+* **Header:** `WWW-Authenticate: Basic realm="PingoraProxy"`
+* **Behavior:** This tells the browser, "I need Basic credentials for the realm 'PingoraProxy'." The browser then opens the username/password dialog.
+
+### 2. Manual Response Construction
+
+The helper method `session.respond_error(401)` is convenient, but it doesn't allow us to inject custom headers like `WWW-Authenticate`.
+To solve this, we must build the response manually using `ResponseHeader::build`, insert our custom header, and send it using `session.write_response_header`.
+
+### 3. Base64 Encoding
+
+Basic Auth credentials are sent as `username:password` encoded in Base64.
+
+* **User:** `admin`
+* **Pass:** `password`
+* **String:** `admin:password`
+* **Base64:** `YWRtaW46cGFzc3dvcmQ=`
+* **Header:** `Authorization: Basic YWRtaW46cGFzc3dvcmQ=`
+
+## The Code (`examples/42_basic_auth.rs`)
+
+To keep our dependencies minimal, we perform a direct string comparison against the pre-calculated Base64 string rather than importing a Base64 library.
+
+```rust
+use async_trait::async_trait;
+use log::{info, warn};
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::http::ResponseHeader; // Required for building custom headers
+
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use std::sync::Arc;
+
+// Expected Header: "Authorization: Basic YWRtaW46cGFzc3dvcmQ="
+// We compare the raw base64 string directly for performance, 
+// avoiding the need to import a base64 decoding crate.
+const EXPECTED_AUTH: &[u8] = b"Basic YWRtaW46cGFzc3dvcmQ=";
+
+pub struct BasicAuthProxy(Arc<LoadBalancer<RoundRobin>>);
+
+#[async_trait]
+impl ProxyHttp for BasicAuthProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let auth_header = session.req_header().headers.get("Authorization");
+
+        match auth_header {
+            // Case A: Missing Credentials -> Send Challenge
+            None => {
+                warn!("Auth Failed: Missing Header. Sending Challenge");
+                
+                // 1. Build a raw 401 response
+                let mut header = ResponseHeader::build(401, Some(3)).unwrap();
+                
+                // 2. Inject the mandatory WWW-Authenticate header
+                // This tells the client (browser) to prompt for "Basic" credentials.
+                header.insert_header("WWW-Authenticate", "Basic realm=\"PingoraProxy\"").unwrap();
+                header.insert_header("Content-Length", "0").unwrap();
+
+                // 3. Write response and close stream (true = End of Stream)
+                session.write_response_header(Box::new(header), true).await?;
+                
+                return Ok(true); // Stop processing
+            }
+            // Case B: Header Present -> Validate
+            Some(value) => {
+                if value.as_bytes() != EXPECTED_AUTH {
+                    warn!("Auth Failed: Wrong Credentials");
+                    // Return 403 to indicate credentials were received but rejected
+                    session.respond_error(403).await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Case C: Success
+        info!("Auth Success: admin:password verified");
+        Ok(false)
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        let upstream = self.0
+            .select(b"", 256)
+            .ok_or_else(|| Error::explain(ErrorType::Custom("NoUpstreamAvailable"), "Empty upstream pool"))?;
+
+        let peer = Box::new(HttpPeer::new(upstream, false, "basic-auth.cluster".to_string()));
+        Ok(peer)
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    let upstreams = LoadBalancer::try_from_iter([
+        "172.28.0.20:8080",
+        "172.28.0.21:8080",
+    ])?;
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, BasicAuthProxy(Arc::new(upstreams)));
+    my_proxy.add_tcp("0.0.0.0:6186");
+
+    info!("Basic Auth Proxy running on 0.0.0.0:6186");
+    info!("Credentials: admin / password");
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify the Challenge, the Failure, and the Success states.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 42_basic_auth
+```
+
+### 2. Test A: The Challenge (Missing Credentials)
+
+```bash
+curl -v http://172.28.0.10:6186/
+```
+
+* **Result:** `401 Unauthorized`.
+* **Crucial Header:** Look for `< WWW-Authenticate: Basic realm="PingoraProxy"`. If this is missing, a browser will not show the login popup.
+
+### 3. Test B: The Rejection (Wrong Password)
+
+```bash
+curl -v -u "admin:wrong" http://172.28.0.10:6186/
+```
+
+* **Result:** `403 Forbidden`.
+* **Log:** `[WARN] Auth Failed: Wrong Credentials`.
+
+### 4. Test C: The Success (Correct Password)
+
+```bash
+curl -v -u "admin:password" http://172.28.0.10:6186/
+```
+
+* **Result:** `200 OK`.
+* **Log:** `[INFO] Auth Success: admin:password verified`.
+
