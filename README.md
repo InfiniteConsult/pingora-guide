@@ -7223,3 +7223,19 @@ curl -v -u "admin:password" http://172.28.0.10:6186/
 * **Result:** `200 OK`.
 * **Log:** `[INFO] Auth Success: admin:password verified`.
 
+# Module 6: Caching
+
+The fastest network request is the one you never make.
+
+In high-scale systems, 80% of the traffic often hits just 20% of the content. Repeatedly asking your backend database to "Get User Profile 123" or "Render Home Page" burns CPU cycles and latency unnecessarily.
+
+**Module 6** introduces the **Pingora Cache** system. We will transform our proxy from a simple router into a high-performance content delivery node.
+
+We will cover:
+
+* **Storage Backends:** How to store responses in memory (RAM) to serve them in microseconds.
+* **Cache Control:** How to obey standard HTTP headers (`Cache-Control`, `Expires`) so the proxy knows *what* to cache and for *how long*.
+* **Request Coalescing:** The "Thundering Herd" problem—what happens when 1,000 users ask for the same missing file at the exact same millisecond? We will learn how to "lock" the cache so only *one* request hits the origin while the others wait.
+* **Advanced Patterns:** Implementing `PURGE` to instantly clear content and `stale-while-revalidate` to update content in the background without slowing down users.
+
+By the end of this module, you will have built a caching layer capable of drastically reducing the load on your upstream servers.
