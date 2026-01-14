@@ -7988,3 +7988,212 @@ done; wait
   * 4 log entries: `Status: HIT (READER). Waited for lock: 2.00s`.
 
 This confirms the lock worked perfectly. The backend was protected, and all clients got the correct data.
+
+# Lesson 46: Cache Purging
+
+Sometimes, caching works *too* well. You fix a typo on your homepage, but the cache is set to expire in 5 minutes. Do you wait 5 minutes while users see the typo?
+
+No. You **Purge** the cache.
+
+In this lesson, we implement the **HTTP PURGE** method.
+
+* **Standard Flow:** `GET /file` -> Returns cached content.
+* **Admin Flow:** `PURGE /file` -> Deletes the content from the cache immediately.
+
+## Key Concepts
+
+### 1. The `PURGE` Verb
+
+It is important to note that `PURGE` is **not a standard HTTP method** (like GET, POST, DELETE). It is not defined in the core HTTP RFCs.
+However, it has become a de-facto standard in the proxy world (popularized by Varnish, Squid, and Fastly) for administrative cache deletion. Browsers never send this method; it is strictly a tool for developers and sysadmins.
+
+### 2. The `is_purge` Hook
+
+Pingora abstracts the complexity of locking and deleting items. You simply implement the `is_purge` method in your trait.
+
+* **Return `true`:** Pingora will take the `CacheKey` (configured in `request_cache_filter`), remove it from the storage backend, and return a `200 OK` to the client. The request **stops** here; it is never sent upstream.
+* **Return `false`:** Pingora processes the request normally (fetch or serve).
+
+### 3. Key Consistency
+
+For a purge to work, the **Cache Key** generated during the `PURGE` request must match the key generated during the original `GET` request **byte-for-byte**.
+
+* If your GET logic includes the `Accept-Encoding` header in the key...
+* But your PURGE request doesn't send that header...
+* The keys won't match, and the purge will fail (nothing gets deleted).
+  In this lesson, we use the simple URL path for the key, ensuring consistency.
+
+## The Code (`examples/46_cache_purge.rs`)
+
+Notice how `request_cache_filter` runs for *every* request. This is crucial because we need to calculate the key *before* we decide whether to fetch (GET) or delete (PURGE).
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::http::ResponseHeader;
+
+use pingora_cache::{MemCache, CacheKey, CacheMetaDefaults, RespCacheable};
+use pingora_cache::cache_control::CacheControl;
+use std::borrow::Cow;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+
+pub struct PurgeProxy;
+
+#[async_trait]
+impl ProxyHttp for PurgeProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 1. Setup the Key (Crucial: Must be identical for GET and PURGE)
+    fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        let path = session.req_header().uri.path();
+        info!("(1) Setup: Configuring CacheKey for path: '{}'", path);
+
+        let key = CacheKey::new("", path, "");
+        session.cache.enable(&*MEM_CACHE, None, None, None, None);
+        session.cache.set_cache_key(key);
+        Ok(())
+    }
+
+    // 2. The Purge Decision
+    // If we return true, Pingora deletes the key and stops processing.
+    fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        let method = &session.req_header().method;
+        if method.as_str() == "PURGE" {
+            info!("(2) Decision: Method is PURGE. Hijacking request to delete item.");
+            return true;
+        }
+        info!("(2) Decision: Method is {}. Proceeding to Standard Cache Flow.", method);
+        false
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        info!("(3) Cache Miss: Connecting to Upstream to fetch fresh content...");
+        let peer = Box::new(HttpPeer::new(("127.0.0.1", 6197), false, "purge.local".to_string()));
+        Ok(peer)
+    }
+
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<RespCacheable> {
+        info!("(4) Validation: Examining Upstream Headers for Cache-Control...");
+        let cc = CacheControl::from_resp_headers(resp);
+        let defaults = CacheMetaDefaults::new(|_| None, 0, 0);
+        Ok(pingora_cache::filters::resp_cacheable(cc.as_ref(), resp.clone(), false, &defaults))
+    }
+}
+
+// Mock Upstream: Returns content valid for 5 minutes (300s)
+async fn run_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:6197").await.unwrap();
+    info!("Upstream running on 127.0.0.1:6197");
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+
+                let body = "Cached Content (TTL 300s)";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Cache-Control: public, max-age=300\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    {}",
+                    body.len(),
+                    body
+                );
+
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    pingora_cache::set_compression_dict_content(Cow::Borrowed(b""));
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_upstream());
+    });
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, PurgeProxy);
+    my_proxy.add_tcp("0.0.0.0:6196");
+
+    info!("Purge Proxy running on 0.0.0.0:6196");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will cache an item, verify it is cached, delete it, and verify it is gone.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 46_cache_purge
+```
+
+### 2. Prime the Cache (Miss)
+
+```bash
+docker exec pingora_client_1 curl -v http://172.28.0.10:6196/file
+```
+
+* **Log:** `(3) Cache Miss: Connecting to Upstream...`
+* **Response Headers:** `Cache-Control: public, max-age=300`
+
+### 3. Verify Hit
+
+```bash
+docker exec pingora_client_1 curl -v http://172.28.0.10:6196/file
+```
+
+* **Log:** (No upstream connection log).
+* **Response Headers:** `Age: 6` (Served from memory).
+
+### 4. Execute Purge
+
+We use `-X PURGE` to change the HTTP verb.
+
+```bash
+docker exec pingora_client_1 curl -v -X PURGE http://172.28.0.10:6196/file
+```
+
+* **Log:** `(2) Decision: Method is PURGE. Hijacking request to delete item.`
+* **Response:** `200 OK`
+
+### 5. Verify Deletion (Miss)
+
+Run the GET command again.
+
+```bash
+docker exec pingora_client_1 curl -v http://172.28.0.10:6196/file
+```
+
+* **Log:** `(3) Cache Miss: Connecting to Upstream...`
+* **Result:** The proxy went back to the upstream, proving the cache entry was deleted.
