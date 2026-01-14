@@ -7239,3 +7239,313 @@ We will cover:
 * **Advanced Patterns:** Implementing `PURGE` to instantly clear content and `stale-while-revalidate` to update content in the background without slowing down users.
 
 By the end of this module, you will have built a caching layer capable of drastically reducing the load on your upstream servers.
+
+# Lesson 43: In-Memory Caching
+
+The fastest way to serve a request is to avoid sending it to the backend at all. **Caching** allows the proxy to store the response from an upstream server (like Blue or Green) and serve it to subsequent users directly from memory.
+
+In this lesson, we implement a **Basic In-Memory Cache**.
+To demonstrate this reliably, we will spin up a small internal "Mock Upstream" that returns a response with `Cache-Control: max-age=60`.
+
+## Key Concepts
+
+### 1. The Caching Lifecycle
+
+Pingora does not cache by default. You must opt-in via two distinct hooks:
+
+1. **`request_cache_filter` (The Setup):**
+   * Runs *before* the upstream connection.
+   * **Action:** Call `session.cache.enable()`. This selects the storage backend (e.g., Memory) and sets the **Cache Key** (e.g., the URL path).
+   * If you skip this, caching is disabled for the request.
+2. **`response_cache_filter` (The Decision):**
+   * Runs *after* the upstream responds but *before* sending headers to the client.
+   * **Action:** Determine if the response is worth keeping. Usually, this involves parsing the `Cache-Control` header.
+
+### 2. `MemCache` Backend
+
+Pingora provides `pingora_cache::memory::MemCache`, a high-performance in-memory storage. It is ephemeral (lost on restart) but extremely fast, making it ideal for hot content.
+
+## The Code (`examples/43_memory_cache.rs`)
+
+We include a helper function `run_mock_upstream` that listens on port `6191`. It mimics a backend that explicitly allows caching via headers.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::http::ResponseHeader;
+
+// Imports for Caching
+use pingora_cache::{MemCache, CacheKey, CacheMetaDefaults, RespCacheable, CachePhase};
+use pingora_cache::cache_control::CacheControl;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::borrow::Cow;
+
+// 1. Initialize Global Memory Storage
+static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+
+pub struct CacheProxy;
+
+#[async_trait]
+impl ProxyHttp for CacheProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 2. Enable Caching for the Request
+    fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        // Define the lookup key: we use the URL path.
+        let key = CacheKey::new("", session.req_header().uri.path(), "");
+        
+        // Enable cache using our MemCache backend.
+        // Args: (Storage, EvictionManager, Predictor, Lock, Stats)
+        session.cache.enable(&*MEM_CACHE, None, None, None, None);
+        session.cache.set_cache_key(key);
+        Ok(())
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Route to our internal mock upstream
+        let peer = Box::new(HttpPeer::new(("127.0.0.1", 6191), false, "cache.local".to_string()));
+        Ok(peer)
+    }
+
+    // 3. Decide if Response is Cacheable
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<RespCacheable> {
+        // Parse the upstream headers (Cache-Control, Expires, etc.)
+        let cc = CacheControl::from_resp_headers(resp);
+
+        // Define defaults if headers are missing (e.g., cache 200 OK for 60s)
+        let defaults = CacheMetaDefaults::new(
+            |status| if status.as_u16() == 200 { Some(Duration::from_secs(60)) } else { None },
+            0,
+            0
+        );
+
+        // Return the decision
+        Ok(pingora_cache::filters::resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            false,
+            &defaults,
+        ))
+    }
+
+    // 4. Log Cache Status
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&Error>,
+        _ctx: &mut Self::CTX,
+    ) {
+        match session.cache.phase() {
+            CachePhase::Hit => info!("Cache Status: HIT (Served from Memory)"),
+            CachePhase::Miss => info!("Cache Status: MISS (Fetched from Upstream)"),
+            CachePhase::Expired => info!("Cache Status: EXPIRED (Revalidating)"),
+            _ => {}
+        }
+    }
+}
+
+// Internal Mock Server to ensure consistent Cache-Control headers
+async fn run_mock_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:6191").await.unwrap();
+    info!("Mock Upstream started on 127.0.0.1:6191");
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+
+                let body = "Response from Local Mock";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Cache-Control: public, max-age=60\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    {}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    
+    // Required for cache metadata compression
+    pingora_cache::set_compression_dict_content(Cow::Borrowed(b""));
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Start the mock upstream in a background thread
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_mock_upstream());
+    });
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, CacheProxy);
+    my_proxy.add_tcp("0.0.0.0:6190");
+
+    info!("Memory Cache Proxy running on 0.0.0.0:6190");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify the entire lifecycle: **Miss** (First fetch) -> **Hit** (Memory serve) -> **Expired** (Re-fetch).
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 43_memory_cache
+```
+
+### 2. First Request (Miss)
+
+```bash
+docker exec pingora_client_1 curl -s http://172.28.0.10:6190/
+```
+
+* **Output:** `Response from Local Mock`
+* **Log:** `Cache Status: MISS (Fetched from Upstream)`
+
+### 3. Second Request (Hit)
+
+Run the same command immediately.
+
+* **Output:** `Response from Local Mock`
+* **Log:** `Cache Status: HIT (Served from Memory)`
+* **Observation:** The proxy did *not* connect to the backend (port 6191). It served the data instantly from RAM.
+
+### 4. Expired Request
+
+Wait 60 seconds (the `max-age` defined in the mock), then run the command again.
+
+* **Output:** `Response from Local Mock`
+* **Log:** `Cache Status: EXPIRED (Revalidating)`
+* **Observation:** Pingora detected the TTL had passed, fetched a fresh copy from the backend, and updated the cache.
+
+## Theory
+
+The Pingora caching system transforms your proxy from a simple traffic router into a sophisticated content delivery engine. To effectively use it, we must understand the specific Rust structures that manage the "Hit or Miss" decision process.
+
+Here is a detailed breakdown of the key components and syntax used in our code.
+
+### 1. The Core Components
+
+#### **MemCache**
+
+* **Definition:** An in-memory implementation of the `Storage` trait provided by `pingora-cache`.
+* **Role:** It acts as the backend "hard drive" for the cache, but stores data in RAM (using a specialized hash map) instead of on disk.
+* **Key Characteristics:**
+  * **Volatile:** Since it lives in RAM, all cache data is lost if the proxy process restarts.
+  * **Fast:** Lookups avoid disk I/O entirely, offering microsecond-level latency.
+  * **Concurrency:** It uses `RwLock` (Read-Write Lock) mechanisms to safely allow multiple concurrent readers while ensuring data integrity during writes.
+  * **Storage Logic:** It maps a hashed `CacheKey` to a `CacheObject`, which contains both the metadata header (expiry, headers) and the body payload.
+
+#### **CacheKey**
+
+* **Definition:** A struct that uniquely identifies a cacheable asset.
+* **Role:** It functions as the lookup address for the storage backend. If two different user requests generate the same `CacheKey`, they will map to the same cached object.
+* **Composition:**
+  1. **Primary Key:** Usually derived from the URL path (e.g., `/images/logo.png`).
+  2. **Namespace:** An optional prefix to isolate distinct datasets (e.g., `v1` vs `v2` of an API).
+  3. **User Tag:** An optional tag to shard storage by user (e.g., specific cache partitions for specific customers).
+  4. **Variance:** Handles `Vary` headers. For example, it ensures a request with `Accept-Encoding: gzip` gets a compressed version, while `identity` gets a plain version, even if the URL is the same.
+
+
+* **Hashing:** Internally, Pingora uses the **Blake2b** algorithm to generate a 128-bit binary hash from these components for efficient storage lookup.
+
+#### **CacheMetaDefaults**
+
+* **Definition:** A configuration struct that defines the "fallback" behavior.
+* **Role:** Upstream servers are often imperfect and forget to send `Cache-Control` headers. This struct acts as the proxy's internal policy engine to decide what to do in those cases.
+* **Key Fields:**
+  * `fresh_sec_fn`: A function mapping an HTTP Status Code to a Duration. (e.g., "If `200 OK`, cache for 60s. If `500 Error`, do not cache").
+  * `stale_while_revalidate_sec`: Defines the window where it is acceptable to serve expired content while a background fetch refreshes the data.
+  * `stale_if_error_sec`: Defines how long to serve old content if the upstream server goes down.
+
+#### **RespCacheable**
+
+* **Definition:** An enum representing the final verdict on whether a specific response *can* be cached.
+* **Role:** This is the output of your logic in `response_cache_filter`.
+* **Variants:**
+  1. **`Cacheable(CacheMeta)`**: The verdict is **Yes**. The struct contains the calculated metadata (expiry timestamp, headers to preserve).
+  2. **`Uncacheable(NoCacheReason)`**: The verdict is **No**. It includes the specific reason (e.g., `OriginNotCache` if the upstream sent `no-store`, or `ResponseTooLarge`).
+
+#### **CachePhase**
+
+* **Definition:** An enum tracking the lifecycle state of a request relative to the cache system.
+* **Role:** It acts as a state machine indicator, primarily useful for observability (logging/metrics) and debugging.
+* **Common States:**
+  * `Disabled`: The cache was never enabled for this request.
+  * `Miss`: Content was not found in storage; currently fetching from upstream.
+  * `Hit`: Content was found and is fresh; serving directly from cache.
+  * `Stale`: Content was found but has expired; a revalidation request is required.
+  * `Revalidated`: Stale content was confirmed as still valid by the upstream (via a `304 Not Modified` response).
+
+#### **CacheControl**
+
+* **Definition:** A parser for the standard HTTP `Cache-Control` header.
+* **Role:** It takes raw header strings (e.g., `public, max-age=3600, no-transform`) and parses them into a structured `DirectiveMap`.
+* **Capabilities:**
+  * Extracts critical directives like `max-age`, `s-maxage`, `no-store`, and `private`.
+  * Handles edge cases like quoting and case-insensitivity (e.g., `Max-Age="60"`).
+  * Implements `InterpretCacheControl` to calculate actual Time-To-Live (TTL) durations according to strict RFC 9111 rules.
+
+---
+
+### 2. Explanation of `&*` in `enable`
+
+You may have noticed this specific syntax in the code:
+
+```rust
+static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+// ...
+session.cache.enable(&*MEM_CACHE, ...);
+```
+
+This `&*` pattern is a Rust idiom used to satisfy type coercion and lifetime requirements when dealing with `Lazy` static variables.
+
+1. **The Type of `MEM_CACHE`:**
+   `MEM_CACHE` is declared as `Lazy<MemCache>`. It is not a `MemCache` struct directly; it is a wrapper that ensures initialization happens only on first access.
+2. **The Dereference (`*`):**
+   `Lazy<T>` implements the `Deref` trait.
+   * `*MEM_CACHE` dereferences the `Lazy` wrapper to access the underlying value.
+   * Effectively, this operation extracts the actual `MemCache` instance inside the static variable.
+3. **The Reference (`&`):**
+   The `&` operator then takes a reference to that dereferenced value.
+   * So, `&*MEM_CACHE` results in a reference of type `&MemCache`.
+4. **The Target Type (`dyn Storage`):**
+   The `enable` function signature expects a reference to a Trait Object:
+   ```rust
+   pub fn enable(&mut self, storage: &'static (dyn Storage + Sync), ...)
+   ```
+   * Since `MemCache` implements the `Storage` trait, Rust automatically coerces the concrete `&MemCache` into the dynamic `&dyn Storage` interface.
+5. **Why not just pass `&MEM_CACHE`?**
+   If you tried to pass `&MEM_CACHE`, you would be passing a reference to the wrapper itself (`&Lazy<MemCache>`). The `Lazy` struct does *not* implement the `Storage` trait; only the inner `MemCache` does. Therefore, you must manually peel off the wrapper (`*`) and then reference the inner object (`&`).
+   
+**Summary:** `&*MEM_CACHE` translates to: "Give me a reference to the *actual initialized cache* inside the global wrapper."
