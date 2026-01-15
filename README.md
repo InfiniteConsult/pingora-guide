@@ -8523,3 +8523,235 @@ We will cover:
   * Prometheus Metrics export.
 
 By the end of this module, you will have a template for a high-performance Rust proxy that is ready for deployment.
+
+# Lesson 48: Observability
+
+You cannot optimize what you cannot measure. In a production environment, knowing *that* the server is running isn't enough; you need to know *how* it is running. Are requests taking 10ms or 10s? Is the error rate 0.1% or 5%?
+
+In this lesson, we add **Prometheus Metrics** to our proxy. We will implement two planes of operation:
+
+1. **Traffic Plane (Port 6199):** Where user traffic flows.
+2. **Control Plane (Port 6200):** Where metrics are scraped by your monitoring system.
+
+## Key Concepts
+
+### 1. The "Two-Registry" Trap
+
+This is the most common pitfall when adding metrics to Pingora.
+Pingora uses the `prometheus` crate internally to expose its built-in server metrics. It exposes these via `Service::prometheus_http_service()`.
+
+**The Danger:** If your `Cargo.toml` includes a version of the `prometheus` crate that differs from the one Pingora uses, Rust may compile **two separate copies** of the library.
+
+* **Copy A (Pingora's):** Connected to the HTTP endpoint on port 6200.
+* **Copy B (Yours):** Where you register your custom counters.
+
+**The Result:** You register metrics, but the endpoint returns nothing.
+**The Fix:** Always check which version Pingora depends on:
+
+```bash
+cargo tree -p pingora | grep prometheus
+```
+
+Ensure your `Cargo.toml` matches this version exactly.
+
+### 2. The `CTX` Timer
+
+To measure latency, we need state that persists from the *start* of the request to the *end*.
+
+* **`new_ctx`:** Runs when the request starts. We save `Instant::now()`.
+* **`logging`:** Runs when the request finishes (even if it failed). We calculate `elapsed()` and update the Histogram.
+
+## The Code (`examples/48_observability.rs`)
+
+We simulate two upstreams: "Blue" (Fast, ~10ms) and "Green" (Slow, ~100ms) to generate interesting histogram data.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::services::listening::Service;
+
+use prometheus::{register_histogram, register_int_counter, Histogram, IntCounter};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+static REQUEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// 1. Context to track timing per-request
+pub struct MetricsContext {
+    start_time: Instant,
+}
+
+// 2. Struct holding our metric handles
+pub struct ObservabilityProxy {
+    req_counter: IntCounter,
+    req_histogram: Histogram,
+}
+
+#[async_trait]
+impl ProxyHttp for ObservabilityProxy {
+    type CTX = MetricsContext;
+
+    fn new_ctx(&self) -> Self::CTX {
+        MetricsContext { start_time: Instant::now() }
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX
+    ) -> Result<Box<HttpPeer>> {
+        // Round Robin between Blue (Fast) and Green (Slow)
+        let count = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let (addr, port, label) = if count % 2 == 0 {
+            ("127.0.0.1", 6201, "Blue")
+        } else {
+            ("127.0.0.1", 6202, "Green")
+        };
+
+        info!("Forwarding request #{} to {}", count, label);
+        let peer = Box::new(HttpPeer::new((addr,port), false, "metrics.local".to_string()));
+        Ok(peer)
+    }
+
+    // 3. Record Metrics on Completion
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        let duration = ctx.start_time.elapsed();
+        let duration_secs = duration.as_secs_f64();
+
+        // Update Prometheus Registries
+        self.req_counter.inc();
+        self.req_histogram.observe(duration_secs);
+
+        info!(
+            "Request finished. Path: {}, Latency: {:.4}s, Total Request: {}",
+            session.req_header().uri.path(),
+            duration_secs,
+            self.req_counter.get()
+        );
+    }
+}
+
+// Mock Upstream Helper (Blue/Green)
+async fn run_mock_upstream(port: u16, name: &str, delay_ms: u64) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    info!("{} Upstream started on port {}", name, port);
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let name = name.to_string();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let body = format!("Response from {}", name);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}\n",
+                    body.len() + 1, body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    // Start background mocks
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            tokio::join!(
+                run_mock_upstream(6201, "Blue", 10),
+                run_mock_upstream(6202, "Green", 100),
+            )
+        });
+    });
+
+    // 4. Initialize and Register Metrics
+    // We register them once here. The `ObservabilityProxy` will hold the handles.
+    let proxy = ObservabilityProxy {
+        req_counter: register_int_counter!(
+            "http_requests_total",
+            "Total number of HTTP requests processed."
+        ).unwrap(),
+        req_histogram: register_histogram!(
+            "http_request_duration_seconds",
+            "The HTTP request latency in seconds."
+        ).unwrap(),
+    };
+
+    let mut proxy_service = http_proxy_service(&my_server.configuration, proxy);
+    proxy_service.add_tcp("0.0.0.0:6199");
+    my_server.add_service(proxy_service);
+
+    // 5. Add the Prometheus Endpoint Service
+    // This exposes the /metrics endpoint on port 6200
+    let mut prometheus_service = Service::prometheus_http_service();
+    prometheus_service.add_tcp("0.0.0.0:6200");
+    my_server.add_service(prometheus_service);
+
+    info!("Proxy running on 6199, Metrics on 6200");
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will verify that traffic on the proxy port generates data on the metrics port.
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 48_observability
+```
+
+### 2. Check Empty Metrics
+
+Before sending traffic, ask Prometheus what it sees.
+
+```bash
+docker exec pingora_client_1 curl -s http://172.28.0.10:6200/
+```
+
+* **Result:** You should see the HELP and TYPE lines, but the counter should be `0`.
+
+### 3. Generate Traffic
+
+Send 3 requests. 2 will go to Blue (Fast), 1 to Green (Slow).
+
+```bash
+docker exec pingora_client_1 curl -s http://172.28.0.10:6199/
+docker exec pingora_client_1 curl -s http://172.28.0.10:6199/
+docker exec pingora_client_1 curl -s http://172.28.0.10:6199/
+```
+
+### 4. Verify Metrics
+
+Check the metrics endpoint again.
+
+```bash
+docker exec pingora_client_1 curl -s http://172.28.0.10:6200/
+```
+
+**Analyze the Output:**
+
+* `http_requests_total 3`: Confirms 3 requests were tracked.
+* **Histograms:**
+* `http_request_duration_seconds_bucket{le="0.025"} 2`: Two requests (Blue) finished in under 25ms.
+* `http_request_duration_seconds_bucket{le="0.25"} 3`: All three requests finished in under 250ms (since Green takes ~100ms).
+
+
+
+This confirms we have granular visibility into the performance of our upstreams.
