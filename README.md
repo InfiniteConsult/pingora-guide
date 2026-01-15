@@ -8249,3 +8249,259 @@ docker exec pingora_client_1 curl -v http://172.28.0.10:6196/file
 
 * **Log:** `(3) Cache Miss: Connecting to Upstream...`
 * **Result:** The proxy went back to the upstream, proving the cache entry was deleted.
+
+# Lesson 47: Stale-While-Revalidate (SWR)
+
+In a standard caching setup, when an item expires (TTL hits 0), the very next user to request it suffers a "Cache Miss." They must wait for the backend to generate a fresh response. If your backend takes 2 seconds, that user waits 2 seconds.
+
+**Stale-While-Revalidate (SWR)** eliminates this latency.
+
+* **The Logic:** If an item is expired but *recently* expired (e.g., within 10 seconds), serve the old data **immediately** (0ms latency).
+* **The Magic:** While the user walks away happy with their (slightly old) data, the proxy triggers a **background fetch** to update the cache.
+* **The Result:** The next user gets the fresh data, and *nobody* ever waited for the backend.
+
+## Key Concepts
+
+### 1. The SWR Window
+
+SWR introduces a "grace period" after the `max-age` expires.
+
+* **Fresh (0-5s):** Serve from cache.
+* **Stale Window (5-15s):** Serve stale content + Background Update.
+* **Dead (>15s):** Content is too old. Block and fetch.
+
+### 2. `should_serve_stale` Hook
+
+This is the most critical part of the implementation. By default, Pingora is conservative; it will *not* serve stale data just because you configured a window. You must explicitly authorize it by implementing the `should_serve_stale` method in the `ProxyHttp` trait.
+
+* **Return `true`:** "Yes, I accept the risk of serving old data to keep latency low."
+
+### 3. Cache Locking
+
+SWR relies heavily on the `CacheLock`. When the item enters the Stale Window, Pingora needs to coordinate:
+
+* **Thread A:** Gets the lock, triggers the background fetch.
+* **Thread B:** Sees the lock is busy, sees that stale data is available, and serves it immediately.
+
+## The Code (`examples/47_stale_while_revalidate.rs`)
+
+We configure a **5s Fresh** window and a **10s SWR** window. We also use a slow mock upstream (2s latency) to prove that the client does not wait during the SWR phase.
+
+```rust
+use async_trait::async_trait;
+use log::info;
+use once_cell::sync::Lazy;
+use pingora::prelude::*;
+use pingora::server::{configuration::Opt, Server};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::http::ResponseHeader;
+
+use pingora_cache::{MemCache, CacheKey, CacheMetaDefaults, RespCacheable, CachePhase};
+use pingora_cache::cache_control::CacheControl;
+use pingora_cache::lock::CacheLock;
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+static CACHE_LOCK: Lazy<CacheLock> = Lazy::new(|| CacheLock::new(Duration::from_secs(5)));
+static CONTENT_VERSION: AtomicUsize = AtomicUsize::new(0);
+
+pub struct SWRProxy;
+
+#[async_trait]
+impl ProxyHttp for SWRProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    // 1. Enable Cache with Locking
+    fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        let key = CacheKey::new("", session.req_header().uri.path(), "");
+        session.cache.enable(
+            &*MEM_CACHE,
+            None,
+            None,
+            Some(&*CACHE_LOCK), // Lock is required for SWR coordination
+            None
+        );
+        session.cache.set_cache_key(key);
+        Ok(())
+    }
+
+    async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
+        let peer = Box::new(HttpPeer::new(("127.0.0.1", 6199), false, "swr.local".to_string()));
+        Ok(peer)
+    }
+
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX
+    ) -> Result<RespCacheable> {
+        let cc = CacheControl::from_resp_headers(resp);
+        
+        // 2. Configure Defaults
+        // Fresh: 5s. 
+        // Stale-While-Revalidate: 10s.
+        let defaults = CacheMetaDefaults::new(
+            |status| if status.as_u16() == 200 { Some(Duration::from_secs(5)) } else { None },
+            10, 
+            0
+        );
+        
+        Ok(pingora_cache::filters::resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            false,
+            &defaults
+        ))
+    }
+
+    // 3. The Critical Hook: Authorize Serving Stale
+    fn should_serve_stale(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        error: Option<&Error>,
+    ) -> bool {
+        // If error is None, it means we are revalidating (expired but clean).
+        // Return true to allow SWR.
+        match error {
+            None => true,
+            Some(_) => false, 
+        }
+    }
+
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        let phase = session.cache.phase();
+        match phase {
+            CachePhase::Hit => info!("Status: HIT (Fresh) - Instant Response"),
+            CachePhase::Miss => info!("Status: MISS (Fetching) - Slow Response"),
+            // This is the SWR State
+            CachePhase::Stale | CachePhase::StaleUpdating => {
+                info!("Status: SWR ACTIVATED (Serving Stale while Updating)");
+            }
+            CachePhase::Expired => info!("Status: EXPIRED (Too Old) - Blocking Fetch"),
+            _ => info!("Status: {:?}", phase),
+        }
+    }
+}
+
+// 4. Slow Upstream (2s latency)
+async fn run_slow_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:6199").await.unwrap();
+    info!("Slow Upstream running on 127.0.0.1:6199");
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+
+                // Simulate slow backend
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                let version = CONTENT_VERSION.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = format!("Content Version {}", version);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Cache-Control: public, max-age=5, stale-while-revalidate=10\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    {}",
+                    body.len(),
+                    body
+                );
+
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    pingora_cache::set_compression_dict_content(Cow::Borrowed(b""));
+
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt))?;
+    my_server.bootstrap();
+
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_slow_upstream());
+    });
+
+    let mut my_proxy = http_proxy_service(&my_server.configuration, SWRProxy);
+    my_proxy.add_tcp("0.0.0.0:6198");
+
+    info!("SWR Proxy running on 0.0.0.0:6198");
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}
+```
+
+## Verification
+
+We will observe the transition from **Miss** (Slow) -> **Hit** (Fast) -> **SWR** (Fast & Stale) -> **Hit** (Fast & Updated).
+
+### 1. Start the Proxy
+
+```bash
+RUST_LOG=info cargo run --example 47_stale_while_revalidate
+```
+
+### 2. Initial Fetch (Miss)
+
+```bash
+docker exec pingora_client_1 curl -s http://172.28.0.10:6198/
+```
+
+* **Time:** ~2 seconds.
+* **Output:** `Content Version 1`
+* **Log:** `Status: MISS (Fetching)`
+
+### 3. Immediate Retry (Hit)
+
+```bash
+docker exec pingora_client_1 curl -s http://172.28.0.10:6198/
+```
+
+* **Time:** Instant.
+* **Output:** `Content Version 1`
+* **Log:** `Status: HIT (Fresh)`
+
+### 4. Trigger SWR (Wait 7s)
+
+The content is now 7 seconds old (Fresh limit was 5s).
+
+```bash
+sleep 7
+docker exec pingora_client_1 curl -s http://172.28.0.10:6198/
+```
+
+* **Time:** **Instant!** (This is the key victory).
+* **Output:** `Content Version 1` (Stale data).
+* **Log:** `Status: SWR ACTIVATED`
+
+### 5. Verify Background Update (Wait 3s)
+
+Wait for the background fetch to finish, then check again.
+
+```bash
+sleep 3
+docker exec pingora_client_1 curl -s http://172.28.0.10:6198/
+```
+
+* **Time:** Instant.
+* **Output:** `Content Version 2` (Fresh data).
+* **Log:** `Status: HIT (Fresh)`
+
