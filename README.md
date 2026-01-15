@@ -8505,3 +8505,21 @@ docker exec pingora_client_1 curl -s http://172.28.0.10:6198/
 * **Output:** `Content Version 2` (Fresh data).
 * **Log:** `Status: HIT (Fresh)`
 
+# Module 7: Production Readiness & Architecture
+
+We have spent the last six modules building individual capabilities: Load Balancing, TLS termination, Upstream Health Checks, Traffic Control, and Caching. We have a collection of powerful scripts, but we don't yet have a cohesive **platform**.
+
+In this final module, we transition from writing "example code" to building **production software**. We will refactor our logic into reusable libraries, instrument the system with industry-standard observability tools, and finally assemble every concept we've learned into a single, unified API Gateway.
+
+We will cover:
+
+* **Observability:** Implementing Prometheus metrics to visualize request rates, latency, and error codes in real-time. You can't manage what you can't measure.
+* **Modularity:** Refactoring our monolithic `main.rs` files into a clean, reusable `gateway` library. This is how you structure Rust projects for scale.
+* **The Capstone:** We will build the **Final API Gateway**. It will feature:
+  * Zero-downtime reconfiguration.
+  * Weighted Load Balancing with Health Checks.
+  * Rate Limiting & Authentication.
+  * In-Memory Caching with Stale-While-Revalidate.
+  * Prometheus Metrics export.
+
+By the end of this module, you will have a template for a high-performance Rust proxy that is ready for deployment.
