@@ -27,3 +27,59 @@
 //!     * `From<Error>` for `Box<pingora::Error>`: CRITICAL. This allows us to return
 //!         our custom error type from `ProxyHttp` trait methods, which expect
 //!         Pingora's boxed error type.
+use std::fmt;
+use std::fmt::Formatter;
+
+#[derive(Debug, PartialEq)]
+pub enum GatewayError {
+    UpstreamUnavailable,
+    AuthFailure,
+    RateLimited,
+    InvalidRequest(String),
+    InternalError(String),
+}
+
+impl fmt::Display for GatewayError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for GatewayError {}
+
+#[derive(Debug)]
+pub enum PingoraGuideError {
+    Gateway(GatewayError),
+    Pingora(pingora::Error),
+}
+
+impl std::error::Error for PingoraGuideError {}
+
+impl fmt::Display for PingoraGuideError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            PingoraGuideError::Gateway(e) => write!(f, "Gateway Error {}", e),
+            PingoraGuideError::Pingora(e) => write!(f, "Pingora Error {}", e),
+        }
+    }
+}
+
+impl From<pingora::Error> for PingoraGuideError {
+    fn from(value: pingora::Error) -> Self {
+        PingoraGuideError::Pingora(value)
+    }
+}
+
+impl From<PingoraGuideError> for Box<pingora::Error> {
+    fn from(value: PingoraGuideError) -> Self {
+        match value {
+            PingoraGuideError::Pingora(error) => Box::new(error),
+            PingoraGuideError::Gateway(error) => {
+                pingora::Error::explain(
+                    pingora::ErrorType::Custom("GatewayError"),
+                    error.to_string()
+                )
+            },
+        }
+    }
+}
