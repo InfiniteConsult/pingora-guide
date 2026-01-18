@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use pingora::upstreams::peer::HttpPeer;
 use pingora::proxy::Session;
 
+use crate::error::Result;
 use crate::context::GatewayContext;
 
 #[async_trait]
@@ -26,5 +27,5 @@ pub trait Upstream: Send + Sync {
         &self,
         session: &mut Session,
         ctx: &mut GatewayContext,
-    ) -> pingora::Result<Box<HttpPeer>>;
+    ) -> Result<Box<HttpPeer>>;
 }
