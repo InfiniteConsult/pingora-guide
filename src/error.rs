@@ -83,3 +83,5 @@ impl From<PingoraGuideError> for Box<pingora::Error> {
         }
     }
 }
+
+pub type Result<T> = std::result::Result<T, PingoraGuideError>;

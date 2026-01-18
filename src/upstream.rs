@@ -14,3 +14,17 @@
 //!     * **Input**: Access to the session (for headers/path) and Context (for sticky session keys).
 //!     * **Output**: A `pingora::upstreams::peer::HttpPeer` struct, configured with the target IP, SNI, and TLS settings.
 //!     * **Error**: Returns our `Error` type (e.g., `GatewayError::UpstreamUnavailable`).
+use async_trait::async_trait;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::proxy::Session;
+
+use crate::context::GatewayContext;
+
+#[async_trait]
+pub trait Upstream: Send + Sync {
+    async fn select_peer(
+        &self,
+        session: &mut Session,
+        ctx: &mut GatewayContext,
+    ) -> pingora::Result<Box<HttpPeer>>;
+}
