@@ -129,3 +129,120 @@ mod option_humantime {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod cluster_options {
+        use super::*;
+
+        #[test]
+        fn defaults_are_secure_and_sane() {
+            let opt = ClusterOptions::default();
+            assert_eq!(opt.connect_timeout, Duration::from_secs(5));
+            assert_eq!(opt.read_timeout, Duration::from_secs(60));
+            assert_eq!(opt.write_timeout, Duration::from_secs(60));
+            assert_eq!(opt.idle_timeout, Some(Duration::from_secs(60)));
+            assert!(!opt.enable_h2);
+            assert!(opt.verify_hostname);
+        }
+
+        #[test]
+        fn deserialization_uses_defaults_for_missing_fields() {
+            let yaml = r#"enable_h2: true"#;
+            match serde_yaml::from_str::<ClusterOptions>(yaml) {
+                Ok(opt) => {
+                    assert_eq!(opt.connect_timeout, Duration::from_secs(5));
+                    assert_eq!(opt.read_timeout, Duration::from_secs(60));
+                    assert_eq!(opt.write_timeout, Duration::from_secs(60));
+                    assert_eq!(opt.idle_timeout, Some(Duration::from_secs(60)));
+                    assert!(opt.enable_h2);
+                    assert!(opt.verify_hostname);
+                },
+                Err(_) => { panic!("Error should not be returned") }
+            }
+        }
+
+        #[test]
+        fn deserialization_parses_human_readable_duration() {
+            let yaml = r#"read_timeout: 1m 30s"#;
+            match serde_yaml::from_str::<ClusterOptions>(yaml) {
+                Ok(opt) => {
+                    assert_eq!(opt.read_timeout, Duration::from_secs(90));
+                },
+                Err(_) => { panic!("Error should not be returned") }
+            }
+        }
+
+        #[test]
+        fn deserialization_handles_explicit_nulls() {
+            let yaml = r#"idle_timeout: null"#;
+            match serde_yaml::from_str::<ClusterOptions>(yaml) {
+                Ok(opt) => {
+                    assert_eq!(opt.idle_timeout, None);
+                },
+                Err(_) => { panic!("Error should not be returned") }
+            }
+        }
+
+        #[test]
+        fn deserialization_overrides_all_fields() {
+            let yaml = r#"connect_timeout: 1s
+read_timeout: 1s
+write_timeout: 1s
+idle_timeout: 1s
+enable_h2: true
+verify_hostname: false"#;
+            match serde_yaml::from_str::<ClusterOptions>(yaml) {
+                Ok(opt) => {
+                    assert_eq!(opt.connect_timeout, Duration::from_secs(1));
+                    assert_eq!(opt.read_timeout, Duration::from_secs(1));
+                    assert_eq!(opt.write_timeout, Duration::from_secs(1));
+                    assert_eq!(opt.idle_timeout, Some(Duration::from_secs(1)));
+                    assert!(opt.enable_h2);
+                    assert!(!opt.verify_hostname);
+                },
+                Err(_) => { panic!("Error should not be returned") }
+            }
+        }
+    }
+
+    mod hash_source {
+        use crate::upstream::HashSource;
+
+        #[test]
+        fn deserialization_parses_simple_variant() {
+            let yaml = r#"ClientIp"#;
+            match serde_yaml::from_str::<HashSource>(yaml) {
+                Ok(source) => { assert_eq!(source, HashSource::ClientIp) },
+                Err(_) => { panic!("Error should not be returned") }
+            }
+        }
+
+        #[test]
+        fn deserialization_parses_complex_variant() {
+            let yaml = r#"!Header x-user-id"#;
+            match serde_yaml::from_str::<HashSource>(yaml) {
+                Ok(source) => {
+                    assert_eq!(source, HashSource::Header("x-user-id".to_string()));
+
+                },
+                Err(e) => {
+                    println!("{:?}", e);
+                    panic!("Error should not be returned")
+                }
+            }
+        }
+
+        #[test]
+        fn equality_check_works() {
+            let a1 = HashSource::Header("a".to_string());
+            let a2 = HashSource::Header("a".to_string());
+            let b1 = HashSource::Header("b".to_string());
+
+            assert_eq!(a1, a2);
+            assert_ne!(b1, a1);
+        }
+    }
+}
