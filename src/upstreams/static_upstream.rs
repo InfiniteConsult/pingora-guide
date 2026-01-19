@@ -16,3 +16,34 @@
 //!         * Construct a `Box<HttpPeer>` using the stored configuration.
 //!         * This is a "dumb" connector; it does no load balancing or health checking.
 //!         * Useful for admin APIs or simple sidecars.
+use async_trait::async_trait;
+use pingora::prelude::Session;
+use pingora::upstreams::peer::HttpPeer;
+use crate::context::GatewayContext;
+use crate::upstream::Upstream;
+use crate::error::Result;
+
+
+pub struct StaticUpstream {
+    addr: (String, u16),
+    tls: bool,
+    sni: String,
+}
+
+impl StaticUpstream {
+    pub fn new(addr: (String, u16), tls: bool, sni: String) -> Self {
+        StaticUpstream { addr, tls, sni }
+    }
+}
+
+#[async_trait]
+impl Upstream for StaticUpstream {
+    async fn select_peer(&self, _session: &mut Session, _ctx: &mut GatewayContext) -> Result<Box<HttpPeer>> {
+        Ok(Box::new(HttpPeer::new(
+            self.addr.clone(),
+            self.tls,
+            self.sni.clone(),
+        )))
+    }
+}
+
