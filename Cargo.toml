@@ -2,6 +2,7 @@
 name = "pingora-guide"
 version = "0.1.0"
 edition = "2024"
+autoexamples = false
 
 [dependencies]
 pingora = { version = "0.6.0", features = ["openssl", "proxy", "lb", "cache"] }
