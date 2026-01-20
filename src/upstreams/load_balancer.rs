@@ -30,7 +30,7 @@ use pingora::prelude::{HttpPeer, Session};
 use pingora::utils::tls::CertKey;
 use pingora::upstreams::peer::ALPN;
 use crate::context::GatewayContext;
-use crate::error::{Result, GatewayError};
+use crate::error::{Result, GatewayError, PingoraGuideError};
 use crate::upstream::{ClusterOptions, HashSource};
 use crate::upstream::Upstream;
 
@@ -74,7 +74,7 @@ impl<S> LoadBalancerCluster<S> {
 #[async_trait]
 impl<S> Upstream for LoadBalancerCluster<S>
 where
-    S: BackendSelection + Send + Sync,
+    S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter
 {
     async fn select_peer(&self, session: &mut Session, ctx: &mut GatewayContext) -> Result<Box<HttpPeer>> {
@@ -83,8 +83,11 @@ where
             HashSource::ClientIp => {
                 let client_ip = match session.client_addr() {
                     Some(ip) => {
-                        let inet_ip = ip.as_inet().unwrap();
-                        inet_ip.to_string()
+                        if let Some(socket_ip) = ip.as_inet() {
+                            socket_ip.ip().to_string()
+                        } else {
+                            "unix_local".to_string()
+                        }
                     },
                     None => String::new(),
                 };
@@ -97,15 +100,56 @@ where
                         for part in cookie_str.split(";") {
                             let part = part.trim();
                             if part.starts_with(cookie_key) {
-                                 session_id = part[cookie_key.len()..].to_string()
+                                session_id = part[cookie_key.len()..].to_string();
+                                break;
                             }
                         }
                     }
                 }
                 session_id
             },
-            _ => String::new(),
+            HashSource::Uri => {
+                session.req_header().uri.path().to_string()
+
+            }
+            HashSource::Header(header_key) => {
+                let mut header_val_str = String::new();
+                if let Some(header_val) = session.req_header().headers.get(header_key) {
+                    if let Ok(header_str) = header_val.to_str() {
+                        header_val_str = header_str.to_string();
+                    }
+                }
+                header_val_str
+            }
         };
-        todo!()
+        let key = key_str.as_bytes();
+
+        // probably set configurations for max_iterations somewhere.
+        let mut upstream = self.lb.select(key, 256).ok_or_else(|| PingoraGuideError::Gateway(GatewayError::UpstreamUnavailable))?;
+
+        let mut peer = Box::new(HttpPeer::new(
+            upstream.addr,
+            self.tls,
+            self.sni.clone()
+        ));
+
+        peer.options.connection_timeout = Some(self.options.connect_timeout);
+        peer.options.read_timeout = Some(self.options.read_timeout);
+        peer.options.write_timeout = Some(self.options.write_timeout);
+        peer.options.idle_timeout = self.options.idle_timeout;
+
+        if self.options.enable_h2 {
+            peer.options.alpn = ALPN::H2H1;
+        } else {
+            peer.options.alpn = ALPN::H1;
+        }
+
+        peer.options.verify_hostname = self.options.verify_hostname;
+
+        if let Some(cert) = &self.client_cert {
+            peer.client_cert_key = Some(cert.clone());
+        }
+
+        Ok(peer)
     }
 }
