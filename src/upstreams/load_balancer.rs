@@ -31,7 +31,7 @@ use pingora::utils::tls::CertKey;
 use pingora::upstreams::peer::ALPN;
 use crate::context::GatewayContext;
 use crate::error::{Result, GatewayError, PingoraGuideError};
-use crate::upstream::{ClusterOptions, HashSource};
+use crate::config::{ClusterOptions, HashSource};
 use crate::upstream::Upstream;
 
 pub struct LoadBalancerCluster<S> {

@@ -25,7 +25,8 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::utils::tls::CertKey;
 use pingora::upstreams::peer::ALPN;
 use crate::context::GatewayContext;
-use crate::upstream::{Upstream, ClusterOptions};
+use crate::upstream::Upstream;
+use crate::config::ClusterOptions;
 use crate::error::Result;
 
 
