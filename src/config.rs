@@ -35,6 +35,64 @@
 //!         * specific function to read the file and run `serde_yaml::from_str`.
 
 use std::time::Duration;
+use std::collections::HashMap;
+
+/// A container for network addresses used by your monitoring tools. It decouples the
+/// "Metric" system (Prometheus) from the "Trace" system (OpenTelemetry)
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct ObservabilityConf {
+    pub prometheus_addr: Option<String>,
+    pub otlp_endpoint: Option<String>,
+}
+
+/// Defines the SSL identity of a server listener. It is a grouping of filesystem paths.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct TlsSettings {
+    pub cert_path: String,
+    pub key_path: String,
+    pub mtls_ca_cert: Option<String>
+}
+
+fn default_weight() -> u16 { 1 }
+
+/// A single destination server in a static list
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct BackendConf {
+    pub address: String,
+    #[serde(default = "default_weight")]
+    pub weight: u16,
+}
+
+/// A toggle to tell the file-watcher which parser to use
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    Json,
+    Yaml,
+}
+
+/// The strategy used to pick the next backend
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub enum LoadBalancerSelection {
+    #[default]
+    RoundRobin,
+    Random,
+    Consistent
+}
+
+/// Defines what part of the incoming request is used as the key for Consistent Hashing
+/// (Sticky Sessions)
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HashSource {
+    #[default]
+    None,
+    ClientIp,
+    Uri,
+    Header(String),
+    Cookie(String),
+}
+
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -90,14 +148,94 @@ impl Default for ClusterOptions {
 }
 
 
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum HashSource {
-    None,
-    ClientIp,
-    Uri,
-    Header(String),
-    Cookie(String),
+/// The shared timing parameters for any health check (TCP or HTTP). Flattened into the specific health check variants later
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct HealthCheckCommon {
+    #[serde(with = "humantime_serde", default = "default_health_interval")]
+    pub interval: Duration,
+    #[serde(with = "humantime_serde", default = "default_health_timeout")]
+    pub timeout: Duration,
+    #[serde(default = "default_health_success")]
+    pub consecutive_success: usize,
+    #[serde(default = "default_health_failure")]
+    pub consecutive_failure: usize,
+}
 
+fn default_health_interval() -> Duration { Duration::from_secs(5) }
+fn default_health_timeout() -> Duration { Duration::from_secs(1) }
+fn default_health_success() -> usize { 1 }
+fn default_health_failure() -> usize { 1 }
+
+/// A discriminator for how the Router matches the URL path.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum PathType {
+    #[default]
+    Prefix,
+    Exact,
+    Regex
+}
+
+/// A grouping of header manipulation rules
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct HeaderConf {
+    #[serde(default)]
+    pub add_req_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub remove_req_headers: Vec<String>,
+    #[serde(default)]
+    pub add_resp_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub remove_resp_headers: Vec<String>,
+    #[serde(default)]
+    pub preserve_host_header: bool,
+}
+
+/// Defines who gets limited. When a request comes in, we extract this key to check the counter in the Token Bucket
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKey {
+    #[default]
+    Ip,
+    Header(String)
+}
+
+/// A simple IP Firewall (Allow/Deny list)
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AccessControlConf {
+    #[serde(default)]
+    pub allow: Vec<String>, // List of CIDR ranges allow
+    #[serde(default)]
+    pub deny: Vec<String>, // List of CIDR ranges to block
+}
+
+/// A discriminator for the type of authentication required on a route
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthConf {
+    Basic {
+        realm: String,
+        users: HashMap<String, String>
+    },
+    Request {
+        auth_uri: String,
+        headers_to_copy: Vec<String>
+    },
+}
+
+/// Rules for caching HTTP responses in memory
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CacheConf {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub default_ttl: Duration,
+    #[serde(with = "option_humantime")]
+    pub lock_timeout: Option<Duration>,
+    #[serde(with = "option_humantime")]
+    pub stale_while_revalidate: Option<Duration>,
+    #[serde(default)]
+    pub enable_purge: bool,
 }
 
 mod option_humantime {
@@ -217,7 +355,7 @@ verify_hostname: false"#;
 
         #[test]
         fn deserialization_parses_simple_variant() {
-            let yaml = r#"ClientIp"#;
+            let yaml = r#"client_ip"#;
             match serde_yaml::from_str::<HashSource>(yaml) {
                 Ok(source) => { assert_eq!(source, HashSource::ClientIp) },
                 Err(_) => { panic!("Error should not be returned") }
@@ -226,7 +364,7 @@ verify_hostname: false"#;
 
         #[test]
         fn deserialization_parses_complex_variant() {
-            let yaml = r#"!Header x-user-id"#;
+            let yaml = r#"!header x-user-id"#;
             match serde_yaml::from_str::<HashSource>(yaml) {
                 Ok(source) => {
                     assert_eq!(source, HashSource::Header("x-user-id".to_string()));
