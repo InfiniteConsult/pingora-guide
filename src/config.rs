@@ -36,6 +36,8 @@
 
 use std::time::Duration;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 /// A container for network addresses used by your monitoring tools. It decouples the
 /// "Metric" system (Prometheus) from the "Trace" system (OpenTelemetry)
@@ -73,6 +75,7 @@ pub enum FileFormat {
 
 /// The strategy used to pick the next backend
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadBalancerSelection {
     #[default]
     RoundRobin,
@@ -168,7 +171,7 @@ fn default_health_failure() -> usize { 1 }
 /// A discriminator for how the Router matches the URL path.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "snake_case")]
-enum PathType {
+pub enum PathType {
     #[default]
     Prefix,
     Exact,
@@ -328,6 +331,8 @@ pub struct UpstreamConf {
     #[serde(default)]
     pub options: ClusterOptions,
     #[serde(default)]
+    pub health_check: Option<HealthCheckConf>,
+    #[serde(default)]
     pub backup_backends: Vec<BackendConf>,
 }
 
@@ -344,6 +349,18 @@ pub struct RouteConf {
     #[serde(default)]
     pub headers: HeaderConf,
     pub access_control: Option<AccessControlConf>,
+    pub query_matches: Option<HashMap<String, String>>,
+    pub strip_query_params: Option<Vec<String>>,
+    #[serde(default)]
+    pub compression: bool,
+    pub body_deny_patterns: Option<Vec<String>>,
+    #[serde(default)]
+    pub websocket: bool,
+    #[serde(default)]
+    pub proxy_connect: bool,
+    pub inflight_limit: Option<u32>,
+    pub error_pages: Option<HashMap<u16, String>>,
+    pub cache: Option<CacheConf>,
 }
 
 /// The entry point
@@ -353,6 +370,14 @@ pub struct GatewayConf {
     pub observability: Option<ObservabilityConf>,
     pub upstreams: Vec<UpstreamConf>,
     pub routes: Vec<RouteConf>,
+}
+
+impl GatewayConf {
+    pub fn load_from_yaml<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
+        let conf: Self = serde_yaml::from_str(&content)?;
+        Ok(conf)
+    }
 }
 
 mod option_humantime {
