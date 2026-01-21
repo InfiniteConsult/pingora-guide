@@ -150,7 +150,7 @@ impl Default for ClusterOptions {
 
 /// The shared timing parameters for any health check (TCP or HTTP). Flattened into the specific health check variants later
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct HealthCheckCommon {
+pub struct HealthCheckCommon {
     #[serde(with = "humantime_serde", default = "default_health_interval")]
     pub interval: Duration,
     #[serde(with = "humantime_serde", default = "default_health_timeout")]
@@ -237,6 +237,72 @@ pub struct CacheConf {
     #[serde(default)]
     pub enable_purge: bool,
 }
+
+
+/// Represents a single open port on the server
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ListenerConf {
+    pub address: String,
+    pub tls: Option<TlsSettings>
+}
+
+
+/// The polymorphic configuration for active health probing. It uses the HealthCheckCommon
+/// primitive we defined
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum HealthCheckConf {
+    Tcp(HealthCheckCommon),
+    Http {
+        #[serde(flatten)]
+        common: HealthCheckCommon,
+        path: String,
+        #[serde(default = "default_status_200")]
+        expected_status: u16,
+    },
+    Custom {
+        #[serde(flatten)]
+        common: HealthCheckCommon,
+        command: String,
+    }
+}
+
+/// Parameters for the token bucket algorithm
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RateLimitConf {
+    pub requests_per_sec: u64,
+    pub burst: u64,
+    #[serde(default)]
+    pub key: RateLimitKey,
+}
+
+fn default_refresh() -> Duration { Duration::from_secs(60) }
+
+/// Defines the discovery mechanism - where we find the backend IPs
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UpstreamSource {
+    Static {
+        backends: Vec<BackendConf>
+    },
+    Dns {
+        hostname: String,
+        #[serde(with = "humantime_serde", default = "default_refresh")]
+        refresh_interval: Duration
+    },
+    File {
+        path: String,
+        format: FileFormat,
+        #[serde(with = "humantime_serde", default = "default_refresh")]
+        refresh_interval: Duration
+    },
+    Uds {
+        path: String,
+    }
+}
+
+
+fn default_status_200() -> u16 { 200 }
 
 mod option_humantime {
     use std::time::Duration;
