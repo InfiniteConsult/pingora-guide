@@ -22,7 +22,13 @@
 //!         * Use `downcast_ref` to cast `dyn Any` back to `&T`.
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::time::Instant;
 
+use pingora::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
+use pingora_cache::{CacheKey, CachePhase};
+use pingora_limits::inflight::Guard;
+
+#[derive(Debug)]
 pub struct GatewayContext {
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
@@ -66,4 +72,41 @@ impl GatewayContext {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RequestMeta {
+    pub start_time: Instant,
+    pub request_id: String,
+    pub matched_route_id: Option<String>,
+    pub upstream_id: Option<String>,
+    pub peer_addr: Option<PingoraSocketAddr>,
+    pub sni: Option<String>,
+    pub connection_attempts: usize,
+    pub connection_reused: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityMeta {
+    pub id: String,
+    pub roles: Vec<String>,
+    pub tenant_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ConnectionGuard {
+    pub guard: Guard
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitMeta {
+    pub limit: isize,
+    pub remaining: isize,
+    pub reset_at: u64,
+}
+
+
+#[derive(Debug)]
+pub struct CacheMeta {
+    pub key: CacheKey,
+    pub status: CachePhase,
+}
 
