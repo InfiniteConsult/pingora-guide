@@ -30,7 +30,7 @@ pub struct GatewayContext {
 impl GatewayContext {
     pub fn new() -> Self {
         GatewayContext {
-            state: HashMap::new(),
+            state: HashMap::with_capacity(8),
         }
     }
 
@@ -46,4 +46,24 @@ impl GatewayContext {
         let key = TypeId::of::<T>();
         self.state.get(&key).and_then(|boxed| boxed.downcast_ref())
     }
+
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        let key = TypeId::of::<T>();
+        self.state.get_mut(&key).and_then(|boxed| boxed.downcast_mut())
+    }
+
+    pub fn remove<T: 'static>(&mut self) -> Option<T> {
+        let key = TypeId::of::<T>();
+        let removed = self.state.remove(&key);
+        removed.map(|boxed| {
+            *boxed.downcast::<T>().expect("GatewayContext: TypeId mismatch")
+        })
+    }
+
+    pub fn exists<T: 'static>(&self) -> bool {
+        let key = TypeId::of::<T>();
+        self.state.contains_key(&key)
+    }
 }
+
+
