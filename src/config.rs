@@ -113,9 +113,15 @@ pub struct ClusterOptions {
     pub idle_timeout: Option<Duration>,
     pub enable_h2: bool,
     pub verify_hostname: bool,
+
+    pub tls: bool,
+    pub sni: Option<String>,
+    #[serde(default="default_pool_size")]
+    pub connection_pool_size: usize,
 }
 
 fn default_timeout() -> Option<Duration> { Some(Duration::from_secs(60)) }
+fn default_pool_size() -> usize { 4 }
 
 impl ClusterOptions {
     pub fn new(
@@ -125,6 +131,9 @@ impl ClusterOptions {
         idle_timeout: Option<Duration>,
         enable_h2: bool,
         verify_hostname: bool,
+        tls: bool,
+        sni: Option<String>,
+        connection_pool_size: usize
     ) -> Self {
         Self {
             connect_timeout,
@@ -132,7 +141,10 @@ impl ClusterOptions {
             write_timeout,
             idle_timeout,
             enable_h2,
-            verify_hostname
+            verify_hostname,
+            tls,
+            sni,
+            connection_pool_size,
         }
     }
 }
@@ -146,6 +158,9 @@ impl Default for ClusterOptions {
             Some(Duration::from_secs(60)),
             false,
             true,
+            false,
+            None,
+            default_pool_size()
         )
     }
 }
@@ -309,13 +324,21 @@ pub enum UpstreamSource {
 pub struct ServerConf {
     #[serde(default)]
     pub listeners: Vec<ListenerConf>,
+    #[serde(default)]
     pub daemon: bool,
     pub pid_file: Option<String>,
     pub user: Option<String>,
     pub group: Option<String>,
     pub worker_threads: Option<usize>,
+    #[serde(default)]
     pub watch_config: bool,
     pub client_max_body_size: Option<usize>,
+    #[serde(default)]
+    pub enable_h2: bool,
+    #[serde(default)]
+    pub enable_h2c: bool,
+    #[serde(with = "option_humantime", default)]
+    pub graceful_shutdown_timeout: Option<Duration>,
 }
 
 /// The "Class" of backend. It combines Discovery + Selection + Health + Connection settings.
