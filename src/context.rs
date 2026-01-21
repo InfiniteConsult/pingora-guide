@@ -84,6 +84,21 @@ pub struct RequestMeta {
     pub connection_reused: bool,
 }
 
+impl Default for RequestMeta {
+    fn default() -> Self {
+        Self {
+            start_time: Instant::now(),
+            request_id: String::new(),
+            matched_route_id: None,
+            upstream_id: None,
+            peer_addr: None,
+            sni: None,
+            connection_attempts: 0,
+            connection_reused: false
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IdentityMeta {
     pub id: String,
