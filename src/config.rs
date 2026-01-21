@@ -87,13 +87,14 @@ pub enum LoadBalancerSelection {
 /// (Sticky Sessions)
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[serde(tag = "type")]
 pub enum HashSource {
     #[default]
     None,
     ClientIp,
     Uri,
-    Header(String),
-    Cookie(String),
+    Header { name: String},
+    Cookie { name: String },
 }
 
 
@@ -520,7 +521,7 @@ verify_hostname: false"#;
 
         #[test]
         fn deserialization_parses_simple_variant() {
-            let yaml = r#"client_ip"#;
+            let yaml = r#"type: client_ip"#;
             match serde_yaml::from_str::<HashSource>(yaml) {
                 Ok(source) => { assert_eq!(source, HashSource::ClientIp) },
                 Err(_) => { panic!("Error should not be returned") }
@@ -529,11 +530,11 @@ verify_hostname: false"#;
 
         #[test]
         fn deserialization_parses_complex_variant() {
-            let yaml = r#"!header x-user-id"#;
+            let yaml = "type: header\nname: x-user-id";
+
             match serde_yaml::from_str::<HashSource>(yaml) {
                 Ok(source) => {
-                    assert_eq!(source, HashSource::Header("x-user-id".to_string()));
-
+                    assert_eq!(source, HashSource::Header { name: "x-user-id".to_string() });
                 },
                 Err(e) => {
                     println!("{:?}", e);
@@ -544,12 +545,14 @@ verify_hostname: false"#;
 
         #[test]
         fn equality_check_works() {
-            let a1 = HashSource::Header("a".to_string());
-            let a2 = HashSource::Header("a".to_string());
-            let b1 = HashSource::Header("b".to_string());
+            let a1 = HashSource::Header { name: "a".to_string() };
+            let a2 = HashSource::Header { name: "a".to_string() };
+            let b1 = HashSource::Header { name: "b".to_string() };
 
             assert_eq!(a1, a2);
             assert_ne!(b1, a1);
         }
     }
 }
+
+

@@ -116,7 +116,8 @@ upstreams:
     # [Ex 29] Sticky Sessions via Consistent Hashing on Cookie
     selection: consistent
     hash_source:
-      cookie: "session_id"
+      type: cookie
+      name: "session_id"
 
     # [Ex 31] HTTP Health Check
     health_check:
@@ -148,7 +149,8 @@ upstreams:
 
     selection: consistent
     # Sticky based on Client IP Address
-    hash_source: client_ip
+    hash_source:
+      type: client_ip
 
     # [Ex 32] Custom Health Check (Shell Command)
     health_check:

@@ -54,7 +54,7 @@ impl<S> LoadBalancerCluster<S> {
     ) -> Self {
         let hash_source = match hash_source {
             Some(h) => match h {
-                HashSource::Cookie(s) => HashSource::Cookie(s + "="),
+                HashSource::Cookie { name } => HashSource::Cookie { name: name  + "=" },
                 _ => h
             },
             None => HashSource::None
@@ -93,7 +93,8 @@ where
                 };
                 client_ip
             },
-            HashSource::Cookie(cookie_key) => {
+            HashSource::Cookie { name } => {
+                let cookie_key = name;
                 let mut session_id = String::new();
                 if let Some(header_val) = session.req_header().headers.get("Cookie") {
                     if let Ok(cookie_str) = header_val.to_str() {
@@ -112,7 +113,8 @@ where
                 session.req_header().uri.path().to_string()
 
             }
-            HashSource::Header(header_key) => {
+            HashSource::Header { name } => {
+                let header_key = name;
                 let mut header_val_str = String::new();
                 if let Some(header_val) = session.req_header().headers.get(header_key) {
                     if let Ok(header_str) = header_val.to_str() {
