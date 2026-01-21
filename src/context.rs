@@ -103,10 +103,23 @@ pub struct RateLimitMeta {
     pub reset_at: u64,
 }
 
-
 #[derive(Debug)]
 pub struct CacheMeta {
     pub key: CacheKey,
     pub status: CachePhase,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecurityMeta {
+    pub decision: SecurityDecision,
+    pub rule_id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityDecision {
+    Allow,
+    Block,
+    Monitor,
 }
 
