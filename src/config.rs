@@ -555,4 +555,301 @@ verify_hostname: false"#;
     }
 }
 
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::path::Path;
 
+    #[test]
+    fn test_load_full_kitchen_sink_yaml() {
+        // Defines the path to the file in the project root
+        let path = "gateway_full.yaml";
+
+        // Guard: Check if file exists so the test doesn't panic on CI/clean clones
+        if !Path::new(path).exists() {
+            eprintln!("Skipping integration test: '{}' not found.", path);
+            return;
+        }
+
+        // Action: Load via the Factory Method
+        println!("Loading configuration from {}...", path);
+        let result = GatewayConf::load_from_yaml(path);
+
+        // Assert: It must parse successfully
+        match &result {
+            Ok(conf) => {
+                println!("  Configuration loaded successfully!");
+                println!("   Listeners: {}", conf.server.listeners.len());
+                println!("   Upstreams: {}", conf.upstreams.len());
+                println!("   Routes:    {}", conf.routes.len());
+            },
+            Err(e) => {
+                panic!("  Failed to parse kitchen sink YAML: {}", e);
+            }
+        }
+
+        // Basic Sanity Checks (Verification without deep inspection)
+        let conf = result.unwrap();
+        println!("GatewayConf {:?}", conf);
+        assert_eq!(conf.server.listeners.len(), 3, "Should have 3 listeners (HTTP, HTTPS, mTLS)");
+        assert_eq!(conf.upstreams.len(), 4, "Should have 4 upstreams (Legacy, API, Inventory, Logger)");
+        assert_eq!(conf.routes.len(), 5, "Should have 5 routes defined");
+
+        // ========================================================================
+        // 1. SERVER CONFIGURATION
+        // ========================================================================
+        let server = &conf.server;
+
+        // Listeners
+        assert_eq!(server.listeners[0].address, "0.0.0.0:8080");
+        assert!(server.listeners[0].tls.is_none());
+
+        assert_eq!(server.listeners[1].address, "0.0.0.0:8443");
+        let tls_server = server.listeners[1].tls.as_ref().unwrap();
+        assert_eq!(tls_server.cert_path, "/etc/gateway/certs/server.crt");
+        assert!(tls_server.mtls_ca_cert.is_none());
+
+        assert_eq!(server.listeners[2].address, "0.0.0.0:9443");
+        let tls_mtls = server.listeners[2].tls.as_ref().unwrap();
+        assert_eq!(tls_mtls.mtls_ca_cert.as_deref(), Some("/etc/gateway/certs/ca.pem"));
+
+        // Process Settings
+        assert_eq!(server.daemon, true);
+        assert_eq!(server.pid_file.as_deref(), Some("/var/run/pingora.pid"));
+        assert_eq!(server.user.as_deref(), Some("www-data"));
+        assert_eq!(server.worker_threads, Some(8));
+        assert_eq!(server.watch_config, true);
+
+        // Protocols & Safety
+        assert_eq!(server.enable_h2, true);
+        assert_eq!(server.enable_h2c, false);
+        assert_eq!(server.client_max_body_size, Some(10485760));
+        assert_eq!(server.graceful_shutdown_timeout, Some(Duration::from_secs(30)));
+
+        // ========================================================================
+        // 2. OBSERVABILITY
+        // ========================================================================
+        let obs = conf.observability.as_ref().unwrap();
+        assert_eq!(obs.prometheus_addr.as_deref(), Some("0.0.0.0:9090"));
+        assert_eq!(obs.otlp_endpoint.as_deref(), Some("http://jaeger:14268"));
+
+        // ========================================================================
+        // 3. UPSTREAMS (A & B)
+        // ========================================================================
+
+        // --- Upstream A: Static / Legacy ---
+        let up_legacy = conf.upstreams.iter().find(|u| u.id == "legacy-cluster").unwrap();
+
+        // Flattened Source Check (Static)
+        match &up_legacy.source {
+            UpstreamSource::Static { backends } => {
+                assert_eq!(backends.len(), 2);
+                assert_eq!(backends[0].address, "10.0.0.1:80");
+                assert_eq!(backends[0].weight, 10);
+                assert_eq!(backends[1].address, "10.0.0.2:80");
+                assert_eq!(backends[1].weight, 1);
+            },
+            _ => panic!("Expected Static source for legacy-cluster"),
+        }
+
+        // Selection & Health
+        assert!(matches!(up_legacy.selection, LoadBalancerSelection::RoundRobin));
+
+        match up_legacy.health_check.as_ref().unwrap() {
+            HealthCheckConf::Tcp(common) => {
+                assert_eq!(common.interval, Duration::from_secs(5));
+                assert_eq!(common.consecutive_failure, 3);
+            },
+            _ => panic!("Expected TCP health check"),
+        }
+
+        // Backup Backends
+        assert_eq!(up_legacy.backup_backends[0].address, "10.0.0.99:80");
+
+        // Options
+        assert_eq!(up_legacy.options.connect_timeout, Duration::from_millis(500));
+        assert_eq!(up_legacy.options.connection_pool_size, 128);
+        assert_eq!(up_legacy.options.tls, false);
+
+
+        // --- Upstream B: DNS / API ---
+        let up_api = conf.upstreams.iter().find(|u| u.id == "api-service").unwrap();
+
+        // Flattened Source Check (DNS)
+        match &up_api.source {
+            UpstreamSource::Dns { hostname, refresh_interval } => {
+                assert_eq!(hostname, "api.internal.svc");
+                assert_eq!(refresh_interval, &Duration::from_secs(30));
+            },
+            _ => panic!("Expected DNS source for api-service"),
+        }
+
+        // Hash Source (The Struct Variant Fix)
+        assert!(matches!(up_api.selection, LoadBalancerSelection::Consistent));
+        match &up_api.hash_source {
+            HashSource::Cookie { name } => assert_eq!(name, "session_id"),
+            _ => panic!("Expected Cookie hash source"),
+        }
+
+        // HTTP Health Check
+        match up_api.health_check.as_ref().unwrap() {
+            HealthCheckConf::Http { common, path, expected_status } => {
+                assert_eq!(path, "/health");
+                assert_eq!(*expected_status, 200);
+                assert_eq!(common.interval, Duration::from_secs(10));
+            },
+            _ => panic!("Expected HTTP health check"),
+        }
+
+        // Advanced Options
+        assert_eq!(up_api.options.tls, true);
+        assert_eq!(up_api.options.sni.as_deref(), Some("api.internal.svc"));
+        assert_eq!(up_api.options.enable_h2, true);
+
+        // ========================================================================
+        // 3. UPSTREAMS (C & D)
+        // ========================================================================
+
+        // --- Upstream C: File / Inventory ---
+        let up_inv = conf.upstreams.iter().find(|u| u.id == "inventory-service").unwrap();
+
+        // Flattened Source Check (File)
+        match &up_inv.source {
+            UpstreamSource::File { path, format, refresh_interval } => {
+                assert_eq!(path, "/etc/gateway/upstreams/inventory.json");
+                assert!(matches!(format, FileFormat::Json));
+                assert_eq!(refresh_interval, &Duration::from_secs(15));
+            },
+            _ => panic!("Expected File source for inventory-service"),
+        }
+
+        // Hash Source (Unit Variant)
+        // Verify that 'type: client_ip' parsed correctly into the enum
+        assert!(matches!(up_inv.hash_source, HashSource::ClientIp));
+
+        // Custom Health Check (Shell Command)
+        match up_inv.health_check.as_ref().unwrap() {
+            HealthCheckConf::Custom { common, command } => {
+                assert_eq!(command, "/usr/local/bin/check_inventory.sh");
+                assert_eq!(common.timeout, Duration::from_secs(5));
+            },
+            _ => panic!("Expected Custom health check"),
+        }
+
+        // --- Upstream D: Unix Domain Socket ---
+        let up_uds = conf.upstreams.iter().find(|u| u.id == "local-logger").unwrap();
+
+        // Flattened Source Check (UDS)
+        match &up_uds.source {
+            UpstreamSource::Uds { path } => {
+                assert_eq!(path, "/tmp/logger.sock");
+            },
+            _ => panic!("Expected Uds source for local-logger"),
+        }
+
+        // ========================================================================
+        // 4. ROUTES (1 & 2)
+        // ========================================================================
+
+        // --- Route 1: Secure API (Regex + Security) ---
+        let r1 = conf.routes.iter().find(|r| r.upstream_id == "api-service").unwrap();
+
+        // Path Matching
+        assert_eq!(r1.path, "^/api/v[0-9]+/secure");
+        assert!(matches!(r1.path_type, PathType::Regex));
+
+        // ACL (Firewall)
+        let acl = r1.access_control.as_ref().unwrap();
+        assert!(acl.allow.contains(&"10.0.0.0/8".to_string()));
+        assert!(acl.deny.contains(&"0.0.0.0/0".to_string()));
+
+        // WAF (Body Deny Patterns)
+        let waf = r1.body_deny_patterns.as_ref().unwrap();
+        assert!(waf.contains(&"(?i)union select".to_string()));
+
+        // Inflight Limit
+        assert_eq!(r1.inflight_limit, Some(100));
+
+        // Auth Request (Nginx style)
+        match r1.auth.as_ref().unwrap() {
+            AuthConf::Request { auth_uri, headers_to_copy } => {
+                assert_eq!(auth_uri, "http://auth-service.internal/verify");
+                assert_eq!(headers_to_copy[0], "X-User-ID");
+            },
+            _ => panic!("Expected Request auth type"),
+        }
+
+
+        // --- Route 2: Public Web (Prefix + Optimization) ---
+        let r2 = conf.routes.iter().find(|r| r.path == "/").unwrap();
+
+        assert!(matches!(r2.path_type, PathType::Prefix));
+        assert_eq!(r2.upstream_id, "legacy-cluster");
+
+        // SNI / Hostname Matching
+        let hosts = r2.hostnames.as_ref().unwrap();
+        assert!(hosts.contains(&"www.example.com".to_string()));
+
+        // Headers
+        assert_eq!(r2.headers.add_req_headers.get("X-Gateway").unwrap(), "Pingora-Rust");
+        assert!(r2.headers.remove_resp_headers.contains(&"Server".to_string()));
+        assert_eq!(r2.headers.preserve_host_header, true);
+
+        // Compression
+        assert_eq!(r2.compression, true);
+
+        // Rate Limiting
+        let rl = r2.rate_limit.as_ref().unwrap();
+        assert_eq!(rl.requests_per_sec, 50);
+        assert_eq!(rl.burst, 10);
+        assert!(matches!(rl.key, RateLimitKey::Ip));
+
+        // Custom Error Pages
+        let errs = r2.error_pages.as_ref().unwrap();
+        assert_eq!(errs.get(&404).unwrap(), "/var/www/errors/404.html");
+
+        // ========================================================================
+        // 4. ROUTES (3, 4, & 5)
+        // ========================================================================
+
+        // --- Route 3: Advanced Caching ---
+        let r3 = conf.routes.iter().find(|r| r.path == "/static").unwrap();
+
+        let cache = r3.cache.as_ref().unwrap();
+        assert_eq!(cache.enabled, true);
+        assert_eq!(cache.default_ttl, Duration::from_secs(3600)); // 1h
+
+        // Shim Verification: "500ms" string -> Option<Duration>
+        assert_eq!(cache.lock_timeout, Some(Duration::from_millis(500)));
+        assert_eq!(cache.stale_while_revalidate, Some(Duration::from_secs(60)));
+        assert_eq!(cache.enable_purge, true);
+
+
+        // --- Route 4: Real-time & Tunneling ---
+        let r4 = conf.routes.iter().find(|r| r.path == "/ws/chat").unwrap();
+
+        assert!(matches!(r4.path_type, PathType::Exact));
+        assert_eq!(r4.websocket, true);
+        assert_eq!(r4.proxy_connect, false);
+
+        // Query Param Routing
+        let query = r4.query_matches.as_ref().unwrap();
+        assert_eq!(query.get("version").unwrap(), "2");
+
+        // Query Stripping
+        let strip = r4.strip_query_params.as_ref().unwrap();
+        assert!(strip.contains(&"api_key".to_string()));
+
+
+        // --- Route 5: Basic Auth Admin ---
+        let r5 = conf.routes.iter().find(|r| r.path == "/admin").unwrap();
+
+        match r5.auth.as_ref().unwrap() {
+            AuthConf::Basic { realm, users } => {
+                assert_eq!(realm, "Admin Area");
+                assert_eq!(users.get("admin").unwrap(), "secret_password_123");
+            },
+            _ => panic!("Expected Basic auth type"),
+        }
+    }
+}
