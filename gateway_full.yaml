@@ -1,0 +1,281 @@
+# ==============================================================================
+# Pingora Gateway - Comprehensive "Kitchen Sink" Configuration
+# ==============================================================================
+# This file demonstrates every possible configuration option derived from
+# Examples 00 through 48.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Server Configuration
+# Covers: Ex 00, 02, 03, 04, 07, 12, 14, 15, 35
+# ------------------------------------------------------------------------------
+server:
+  # [Ex 00 & 07] Support for multiple listening interfaces (HTTP & HTTPS)
+  listeners:
+    # 1. Standard HTTP
+    - address: "0.0.0.0:8080"
+      tls: null
+
+    # 2. HTTPS with Server-Side TLS
+    - address: "0.0.0.0:8443"
+      tls:
+        cert_path: "/etc/gateway/certs/server.crt"
+        key_path: "/etc/gateway/certs/server.key"
+        mtls_ca_cert: null # No client auth required
+
+    # 3. mTLS (Mutual TLS)
+    - address: "0.0.0.0:9443"
+      tls:
+        cert_path: "/etc/gateway/certs/mtls_server.crt"
+        key_path: "/etc/gateway/certs/mtls_server.key"
+        # [Ex 21] Client Certificate Authentication
+        # Clients must present a cert signed by this CA to connect.
+        mtls_ca_cert: "/etc/gateway/certs/ca.pem"
+
+  # [Ex 02] Daemon & Privileges
+  daemon: true
+  pid_file: "/var/run/pingora.pid"
+  user: "www-data"
+  group: "www-data"
+
+  # [Ex 04] Runtime Tuning
+  # If omitted, defaults to the number of CPU cores.
+  worker_threads: 8
+
+  # [Ex 35] Dynamic Reconfiguration (Hot Reload)
+  # The server will watch this file and reload changes without dropping connections.
+  watch_config: true
+
+  # [Ex 03] Graceful Shutdown settings
+  graceful_shutdown_timeout: "30s"
+
+  # [Ex 14 & 15] Protocol Settings
+  enable_h2: true   # HTTP/2 support
+  enable_h2c: false # HTTP/2 over Cleartext (usually false for production)
+
+  # [Ex 12] Security: Global Request Size Limit
+  # Rejects uploads larger than 10MB immediately.
+  client_max_body_size: 10485760
+
+# ------------------------------------------------------------------------------
+# 2. Observability
+# Covers: Ex 48
+# ------------------------------------------------------------------------------
+observability:
+  prometheus_addr: "0.0.0.0:9090"        # Scrape endpoint for metrics
+  otlp_endpoint: "http://jaeger:14268" # Endpoint for OTEL traces
+
+# ------------------------------------------------------------------------------
+# 3. Upstreams
+# Covers: Ex 16-19, 25-34
+# ------------------------------------------------------------------------------
+upstreams:
+
+  # --- Upstream A: Static Weighted Cluster (Round Robin) ---
+  # Covers: Ex 16, 27, 30
+  - id: "legacy-cluster"
+    # Source: Static List
+    type: static
+    backends:
+      - address: "10.0.0.1:80"
+        weight: 10
+      - address: "10.0.0.2:80"
+        weight: 1
+
+    selection: round_robin
+
+    # [Ex 30] TCP Health Check
+    health_check:
+      protocol: tcp
+      interval: "5s"
+      timeout: "1s"
+      consecutive_success: 1
+      consecutive_failure: 3
+
+    # [Ex 33] Active/Passive Failover
+    # These are used only if the primary pool is completely unhealthy/empty.
+    backup_backends:
+      - address: "10.0.0.99:80"
+        weight: 1
+
+    # [Ex 19 & 25] Connection Options
+    options:
+      connect_timeout: "500ms"
+      read_timeout: "2s"
+      connection_pool_size: 128
+      tls: false
+
+  # --- Upstream B: DNS Discovery + Sticky Sessions + H2 ---
+  # Covers: Ex 17, 25, 29, 31, 19
+  - id: "api-service"
+    # Source: Dynamic DNS
+    type: dns
+    hostname: "api.internal.svc"
+    refresh_interval: "30s"
+
+    # [Ex 29] Sticky Sessions via Consistent Hashing on Cookie
+    selection: consistent
+    hash_source:
+      cookie: "session_id"
+
+    # [Ex 31] HTTP Health Check
+    health_check:
+      protocol: http
+      path: "/health"
+      expected_status: 200
+      interval: "10s"
+      timeout: "2s"
+      consecutive_success: 2
+      consecutive_failure: 2
+
+    # TLS & Protocol Options
+    options:
+      tls: true
+      sni: "api.internal.svc"
+      enable_h2: true
+      connect_timeout: "500ms"
+      read_timeout: "5s"
+      connection_pool_size: 256
+
+  # --- Upstream C: File Discovery + IP Hash + Custom Health Check ---
+  # Covers: Ex 34, 32
+  - id: "inventory-service"
+    # Source: External File
+    type: file
+    path: "/etc/gateway/upstreams/inventory.json"
+    format: json
+    refresh_interval: "15s"
+
+    selection: consistent
+    # Sticky based on Client IP Address
+    hash_source: client_ip
+
+    # [Ex 32] Custom Health Check (Shell Command)
+    health_check:
+      protocol: custom
+      command: "/usr/local/bin/check_inventory.sh"
+      interval: "30s"
+      timeout: "5s"
+      consecutive_success: 1
+      consecutive_failure: 1
+
+  # --- Upstream D: Unix Domain Socket ---
+  # Covers: Ex 18
+  - id: "local-logger"
+    type: uds
+    path: "/tmp/logger.sock"
+    selection: round_robin
+
+# ------------------------------------------------------------------------------
+# 4. Routes
+# Covers: Ex 08-13, 20, 22-23, 36-47
+# ------------------------------------------------------------------------------
+routes:
+
+  # --- Route 1: Secure API (Complex Matching & Security) ---
+  # Covers: Ex 09, 12, 38, 39, 41
+  - path: "^/api/v[0-9]+/secure"
+    path_type: regex             # [Ex 09] Regex Path Matching
+    upstream_id: "api-service"
+
+    # [Ex 39] Firewall / ACL
+    access_control:
+      allow: ["10.0.0.0/8", "192.168.1.0/24"]
+      deny:  ["0.0.0.0/0"]
+
+    # [Ex 12] WAF: Body Inspection Pattern Matching
+    body_deny_patterns:
+      - "(?i)union select"       # Block SQLi
+      - "(?i)<script>"           # Block XSS
+
+    # [Ex 38] Inflight Limit (Max Concurrent Connections)
+    inflight_limit: 100
+
+    # [Ex 41] Sub-request Authentication (Nginx 'auth_request' style)
+    auth:
+      type: request
+      auth_uri: "http://auth-service.internal/verify"
+      headers_to_copy: ["X-User-ID", "X-Role"]
+
+  # --- Route 2: Public Web (Optimization & Headers) ---
+  # Covers: Ex 08, 11, 13, 36
+  - path: "/"
+    path_type: prefix            # Matches everything starting with /
+    upstream_id: "legacy-cluster"
+
+    # [Ex 20] SNI / Hostname Routing
+    hostnames: ["www.example.com", "example.com"]
+
+    # [Ex 11] Response Modification
+    compression: true
+
+    # [Ex 08] Header Manipulation
+    headers:
+      add_req_headers:
+        X-Gateway: "Pingora-Rust"
+      remove_req_headers: ["X-Internal-Debug"]
+      add_resp_headers:
+        Strict-Transport-Security: "max-age=31536000"
+      remove_resp_headers: ["Server"]
+      preserve_host_header: true
+
+    # [Ex 36] Rate Limiting (Token Bucket)
+    rate_limit:
+      requests_per_sec: 50
+      burst: 10
+      key: ip
+
+    # [Ex 13] Custom Error Pages
+    error_pages:
+      404: "/var/www/errors/404.html"
+      500: "/var/www/errors/500.html"
+
+  # --- Route 3: Advanced Caching ---
+  # Covers: Ex 43, 45, 46, 47
+  - path: "/static"
+    path_type: prefix
+    upstream_id: "legacy-cluster"
+
+    cache:
+      enabled: true
+      default_ttl: "1h"
+
+      # [Ex 45] Cache Lock (Stampede Protection)
+      lock_timeout: "500ms"
+
+      # [Ex 47] Stale While Revalidate
+      stale_while_revalidate: "60s"
+
+      # [Ex 46] Allow HTTP PURGE method
+      enable_purge: true
+
+  # --- Route 4: Real-time & Tunneling ---
+  # Covers: Ex 10, 22, 23
+  - path: "/ws/chat"
+    path_type: exact
+    upstream_id: "local-logger"
+
+    # [Ex 23] WebSocket Support
+    websocket: true
+
+    # [Ex 22] HTTP CONNECT Support (Forward Proxy)
+    proxy_connect: false
+
+    # [Ex 10] Query Param Routing & Cleanup
+    query_matches:
+      version: "2"
+    strip_query_params: ["api_key", "debug_token"]
+
+  # --- Route 5: Basic Auth Protected Admin ---
+  # Covers: Ex 42
+  - path: "/admin"
+    path_type: exact
+    upstream_id: "api-service"
+
+    # [Ex 42] Basic Auth
+    auth:
+      type: basic
+      realm: "Admin Area"
+      users:
+        admin: "secret_password_123"
+        monitor: "monitor_password_456"
