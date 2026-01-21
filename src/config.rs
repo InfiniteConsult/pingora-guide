@@ -147,7 +147,6 @@ impl Default for ClusterOptions {
     }
 }
 
-
 /// The shared timing parameters for any health check (TCP or HTTP). Flattened into the specific health check variants later
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct HealthCheckCommon {
@@ -246,6 +245,7 @@ pub struct ListenerConf {
     pub tls: Option<TlsSettings>
 }
 
+fn default_status_200() -> u16 { 200 }
 
 /// The polymorphic configuration for active health probing. It uses the HealthCheckCommon
 /// primitive we defined
@@ -301,8 +301,59 @@ pub enum UpstreamSource {
     }
 }
 
+/// The runtime container. It holds the listeners and process settings
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ServerConf {
+    #[serde(default)]
+    pub listeners: Vec<ListenerConf>,
+    pub daemon: bool,
+    pub pid_file: Option<String>,
+    pub user: Option<String>,
+    pub group: Option<String>,
+    pub worker_threads: Option<usize>,
+    pub watch_config: bool,
+    pub client_max_body_size: Option<usize>,
+}
 
-fn default_status_200() -> u16 { 200 }
+/// The "Class" of backend. It combines Discovery + Selection + Health + Connection settings.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct UpstreamConf {
+    pub id: String,
+    #[serde(flatten)]
+    pub source: UpstreamSource,
+    #[serde(default)]
+    pub selection: LoadBalancerSelection,
+    #[serde(default)]
+    pub hash_source: HashSource,
+    #[serde(default)]
+    pub options: ClusterOptions,
+    #[serde(default)]
+    pub backup_backends: Vec<BackendConf>,
+}
+
+/// The map that connects a Request Path to an Upstream ID
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RouteConf {
+    pub path: String,
+    #[serde(default)]
+    pub path_type: PathType,
+    pub upstream_id: String,
+    pub hostnames: Option<Vec<String>>,
+    pub rate_limit: Option<RateLimitConf>,
+    pub auth: Option<AuthConf>,
+    #[serde(default)]
+    pub headers: HeaderConf,
+    pub access_control: Option<AccessControlConf>,
+}
+
+/// The entry point
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct GatewayConf {
+    pub server: ServerConf,
+    pub observability: Option<ObservabilityConf>,
+    pub upstreams: Vec<UpstreamConf>,
+    pub routes: Vec<RouteConf>,
+}
 
 mod option_humantime {
     use std::time::Duration;
