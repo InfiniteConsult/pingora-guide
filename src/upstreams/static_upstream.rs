@@ -21,10 +21,10 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use pingora::prelude::Session;
-use pingora::upstreams::peer::HttpPeer;
+use pingora::upstreams::peer::{HttpPeer, Peer};
 use pingora::utils::tls::CertKey;
 use pingora::upstreams::peer::ALPN;
-use crate::context::GatewayContext;
+use crate::context::{GatewayContext, RequestMeta};
 use crate::upstream::Upstream;
 use crate::config::ClusterOptions;
 use crate::error::Result;
@@ -52,12 +52,17 @@ impl StaticUpstream {
 
 #[async_trait]
 impl Upstream for StaticUpstream {
-    async fn select_peer(&self, _session: &mut Session, _ctx: &mut GatewayContext) -> Result<Box<HttpPeer>> {
+    async fn select_peer(&self, _session: &mut Session, ctx: &mut GatewayContext) -> Result<Box<HttpPeer>> {
         let mut peer = HttpPeer::new(
             self.addr.clone(),
             self.tls,
             self.sni.clone(),
         );
+
+        if let Some(meta) = ctx.get_mut::<RequestMeta>() {
+            meta.peer_addr = Some(peer.address().clone());
+            meta.sni = Some(self.sni.clone());
+        }
 
         peer.options.connection_timeout = Some(self.options.connect_timeout);
         peer.options.read_timeout = Some(self.options.read_timeout);

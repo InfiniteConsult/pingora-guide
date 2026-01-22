@@ -29,7 +29,7 @@ use pingora::lb::selection::{BackendIter, BackendSelection};
 use pingora::prelude::{HttpPeer, Session};
 use pingora::utils::tls::CertKey;
 use pingora::upstreams::peer::ALPN;
-use crate::context::GatewayContext;
+use crate::context::{GatewayContext, RequestMeta};
 use crate::error::{Result, GatewayError, PingoraGuideError};
 use crate::config::{ClusterOptions, HashSource};
 use crate::upstream::Upstream;
@@ -127,10 +127,15 @@ where
         let key = key_str.as_bytes();
 
         // probably set configurations for max_iterations somewhere.
-        let mut upstream = self.lb.select(key, 256).ok_or_else(|| PingoraGuideError::Gateway(GatewayError::UpstreamUnavailable))?;
+        let upstream = self.lb.select(key, 256).ok_or_else(|| PingoraGuideError::Gateway(GatewayError::UpstreamUnavailable))?;
+
+        if let Some(meta) = ctx.get_mut::<RequestMeta>() {
+            meta.peer_addr = Some(upstream.addr.clone());
+            meta.sni = Some(self.sni.clone());
+        }
 
         let mut peer = Box::new(HttpPeer::new(
-            upstream.addr,
+            upstream,
             self.tls,
             self.sni.clone()
         ));
