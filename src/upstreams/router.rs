@@ -18,6 +18,7 @@
 //!         * If found: Call `select_peer()` on the matched child upstream.
 //!         * If not found: Return `Err(Error::Gateway(GatewayError::NoRouteMatched))`
 //!           (which typically translates to a 404).
+use std::sync::Arc;
 use std::collections::HashMap;
 use regex::Regex;
 use crate::config::{RouteConf, GatewayConf, PathType};
@@ -26,17 +27,17 @@ use crate::config::{RouteConf, GatewayConf, PathType};
 pub struct Router {
     pub regex_routes: Vec<(Regex, usize)>,
     pub matchit_router: matchit::Router<usize>,
-    pub route_registry: HashMap<usize, RouteConf>
+    pub route_registry: HashMap<usize, Arc<RouteConf>>
 }
 
 impl Router {
     pub fn new(conf: &GatewayConf) -> Self {
         let mut regex_routes: Vec<(Regex, usize)> = Vec::new();
         let mut matchit_router: matchit::Router<usize> = matchit::Router::new();
-        let mut route_registry: HashMap<usize, RouteConf> = HashMap::new();
+        let mut route_registry: HashMap<usize, Arc<RouteConf>> = HashMap::new();
 
         for (idx, route) in conf.routes.iter().enumerate() {
-            route_registry.insert(idx, route.clone());
+            route_registry.insert(idx, Arc::new(route.clone()));
             match route.path_type {
                 PathType::Regex => {
                     let re = Regex::new(&route.path).expect("Invalid Regex in configuration");
