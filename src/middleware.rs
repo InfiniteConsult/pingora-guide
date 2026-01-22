@@ -96,8 +96,8 @@ pub trait Middleware: Send + Sync {
 
     async fn handle_error(
         &self,
-        session: &mut Session,
-        e: &Error,
+        _session: &mut Session,
+        _e: &Error,
         _ctx: &mut GatewayContext,
     ) -> Result<MiddlewareDecision> {
         Ok(MiddlewareDecision::Continue)
