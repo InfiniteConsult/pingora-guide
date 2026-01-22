@@ -1,30 +1,33 @@
-//! # Middleware Interface
+//! # Middleware Interface & Lifecycle Mapping
 //!
-//! This module defines the plugin system for the Gateway. It allows logic to be
-//! injected at various stages of the request lifecycle: Request, Response, and Logging.
+//! This module defines the plugin system (`Middleware` trait) for the Gateway. It abstracts
+//! the complex `ProxyHttp` lifecycle into a cleaner, pipeline-based interface.
 //!
-//! ## Implementation Plan
+//! ## Lifecycle Mapping
 //!
-//! 1.  **Define `MiddlewareDecision` Enum**:
-//!     * Variants:
-//!         * `Continue`: Proceed to the next middleware/stage.
-//!         * `Stop`: Halt processing immediately (e.g., if a 403 was sent).
+//! The following table describes how Pingora's `ProxyHttp` stages map to our `Middleware` hooks.
+//! The Gateway executes these hooks in the order defined in the middleware pipeline.
 //!
-//! 2.  **Define `Middleware` Trait**:
-//!     * Must inherit `Sync + Send`.
-//!     * **`handle_request`**:
-//!         * Runs *before* upstream connection.
-//!         * Can modify headers, check security, or return `Stop`.
-//!     * **`handle_response`**:
-//!         * Runs *after* headers are received from upstream.
-//!         * Can modify response headers (e.g. `HSTS`) or decide cacheability.
-//!     * **`handle_logging`**:
-//!         * Runs *after* the session is finished.
-//!         * Used for metrics and observability.
+//! | Stage | Pingora `ProxyHttp` Method | Middleware Hook | Description |
+//! | :--- | :--- | :--- | :--- |
+//! | **1. Early Request** | `early_request_filter` | `handle_early_request` | **Pre-Routing**: IP blocklists, bot detection, and cheap checks before regex parsing. |
+//! | **2. Request** | `request_filter` | `handle_request` | **Post-Routing**: Authentication, Rate Limiting, and business logic. Routing info is available in `ctx`. |
+//! | **3. Request Body** | `request_body_filter` | `handle_request_body` | **Streaming**: WAF inspection or DLP on upload chunks. |
+//! | **4. Cache Init** | `request_cache_filter` | `init_cache` | **Caching**: Enable/Disable caching for this session. |
+//! | **5. Cache Key** | `cache_key_callback` | `cache_key` | **Caching**: Define custom cache keys (e.g. by Accept-Language or API Key). |
+//! | **6. Upstream Req** | `upstream_request_filter` | `handle_upstream_request` | **Injection**: Modify headers sent to backend (e.g. add `X-User-ID`, sign requests). |
+//! | **7. Connection** | `connected_to_upstream` | `handle_upstream_connected` | **Telemetry**: Log connection establishment, validate peer certificates. |
+//! | **8. Upstream Resp**| `upstream_response_filter`| `handle_upstream_response` | **Sanitization**: Modify backend headers *before* they are committed to cache. |
+//! | **9. Response** | `response_filter` | `handle_response` | **Security**: Add headers to client response (HSTS, CSP, CORS). |
+//! | **10. Resp Body** | `response_body_filter` | `handle_response_body` | **Streaming**: Response WAF, body transformation, or scanning. |
+//! | **11. Error** | `fail_to_proxy`, `fail_to_connect`, `error_while_proxy` | `handle_error` | **Recovery**: Serve custom error pages (e.g., 502 Maintenance) or trigger alerts. |
+//! | **12. Logging** | `logging` | `handle_logging` | **Observability**: Finalize metrics, write access logs, end tracing spans. |
 //!
-//! 3.  **Default Implementations**:
-//!     * Provide default "no-op" implementations for all methods so implementors
-//!         only need to define the hooks they care about.
+//! ## Decision Flow
+//!
+//! For hooks returning `MiddlewareDecision`:
+//! * `MiddlewareDecision::Continue`: The Gateway proceeds to the next middleware in the chain.
+//! * `MiddlewareDecision::Stop`: The Gateway **halts** the pipeline immediately. This usually implies the middleware has already sent a response (e.g., 403 Forbidden).
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::Error;
