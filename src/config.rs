@@ -342,6 +342,24 @@ pub struct ServerConf {
     pub graceful_shutdown_timeout: Option<Duration>,
 }
 
+impl Default for ServerConf {
+    fn default() -> Self {
+        Self {
+            listeners: Vec::new(),
+            daemon: false,
+            pid_file: None,
+            user: None,
+            group: None,
+            worker_threads: None,
+            watch_config: false,
+            client_max_body_size: None,
+            enable_h2: false,
+            enable_h2c: false,
+            graceful_shutdown_timeout: None,
+        }
+    }
+}
+
 /// The "Class" of backend. It combines Discovery + Selection + Health + Connection settings.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct UpstreamConf {
@@ -387,6 +405,30 @@ pub struct RouteConf {
     pub cache: Option<CacheConf>,
 }
 
+impl Default for RouteConf {
+    fn default() -> Self {
+        Self {
+            path: "".to_string(),
+            path_type: PathType::Prefix,
+            upstream_id: "".to_string(),
+            hostnames: None,
+            rate_limit: None,
+            auth: None,
+            headers: Default::default(),
+            access_control: None,
+            query_matches: None,
+            strip_query_params: None,
+            compression: false,
+            body_deny_patterns: None,
+            websocket: false,
+            proxy_connect: false,
+            inflight_limit: None,
+            error_pages: None,
+            cache: None,
+        }
+    }
+}
+
 /// The entry point
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct GatewayConf {
@@ -401,6 +443,17 @@ impl GatewayConf {
         let content = fs::read_to_string(path)?;
         let conf: Self = serde_yaml::from_str(&content)?;
         Ok(conf)
+    }
+}
+
+impl Default for GatewayConf {
+    fn default() -> Self {
+        Self {
+            server: ServerConf::default(),
+            observability: None,
+            upstreams: Vec::new(),
+            routes: Vec::new(),
+        }
     }
 }
 
