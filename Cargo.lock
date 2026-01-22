@@ -1430,6 +1430,7 @@ dependencies = [
  "pingora-limits",
  "pingora-load-balancing",
  "prometheus",
+ "regex",
  "serde",
  "serde_yaml 0.9.34+deprecated",
  "thiserror 2.0.17",
