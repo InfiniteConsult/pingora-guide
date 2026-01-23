@@ -85,7 +85,7 @@ pub trait Middleware: Send + Sync {
         Ok(MiddlewareDecision::Continue)
     }
 
-    async fn handle_upstream_response(
+    fn handle_upstream_response(
         &self,
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
@@ -122,7 +122,7 @@ pub trait Middleware: Send + Sync {
         Ok(MiddlewareDecision::Continue)
     }
 
-    async fn handle_response_body(
+    fn handle_response_body(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
