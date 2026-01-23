@@ -63,21 +63,37 @@ impl ProxyHttp for Gateway {
         gateway_context
     }
 
-    async fn early_request_filter(
+    async fn upstream_peer(
         &self,
         session: &mut Session,
         ctx: &mut Self::CTX
-    ) -> pingora::Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        for middleware in &self.middlewares {
-            let result = middleware.handle_early_request(session, ctx).await?;
-            if result == MiddlewareDecision::Stop {
-                break;
+    ) -> pingora::Result<Box<HttpPeer>> {
+        let req_meta = ctx.get::<RequestMeta>().expect("RequestMeta should exist");
+        let upstream_id = match &req_meta.upstream_id {
+            Some(id) => id.clone(),
+            None => {
+                session.respond_error(500).await?;
+                eprintln!("No upstream_id set");
+                return Err(Error::explain(
+                    pingora::ErrorType::Custom("UpstreamError"),
+                    "Upstream id not set"
+                ));
             }
-        }
-        Ok(())
+        };
+        let upstream = match self.upstreams.get(&upstream_id) {
+            Some(upstream) => upstream,
+            None => {
+                session.respond_error(500).await?;
+                eprintln!("No upstream_id set");
+                return Err(Error::explain(
+                    pingora::ErrorType::Custom("UpstreamError"),
+                    "Upstream config not found"
+                ));
+            }
+        };
+
+        let peer = upstream.select_peer(session, ctx).await?;
+        Ok(peer)
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> pingora::Result<bool>
@@ -113,6 +129,23 @@ impl ProxyHttp for Gateway {
         Ok(false)
     }
 
+    async fn early_request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX
+    ) -> pingora::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        for middleware in &self.middlewares {
+            let result = middleware.handle_early_request(session, ctx).await?;
+            if result == MiddlewareDecision::Stop {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -131,46 +164,13 @@ impl ProxyHttp for Gateway {
                 ctx
             ).await?;
             if result == MiddlewareDecision::Stop {
-                return Err(pingora::Error::explain(
+                return Err(Error::explain(
                     pingora::ErrorType::Custom("MiddlewareRejected"),
                     "Body Rejected"
                 ));
             }
         }
         Ok(())
-    }
-
-    async fn upstream_peer(
-        &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX
-    ) -> pingora::Result<Box<HttpPeer>> {
-        let req_meta = ctx.get::<RequestMeta>().expect("RequestMeta should exist");
-        let upstream_id = match &req_meta.upstream_id {
-            Some(id) => id.clone(),
-            None => {
-                session.respond_error(500).await?;
-                eprintln!("No upstream_id set");
-                return Err(pingora::Error::explain(
-                    pingora::ErrorType::Custom("UpstreamError"),
-                    "Upstream id not set"
-                ));
-            }
-        };
-        let upstream = match self.upstreams.get(&upstream_id) {
-            Some(upstream) => upstream,
-            None => {
-                session.respond_error(500).await?;
-                eprintln!("No upstream_id set");
-                return Err(pingora::Error::explain(
-                    pingora::ErrorType::Custom("UpstreamError"),
-                    "Upstream config not found"
-                ));
-            }
-        };
-
-        let peer = upstream.select_peer(session, ctx).await?;
-        Ok(peer)
     }
 
     async fn upstream_request_filter(
@@ -185,7 +185,7 @@ impl ProxyHttp for Gateway {
         for middleware in &self.middlewares {
             let result = middleware.handle_upstream_request(session, upstream_request, ctx).await?;
             if result == MiddlewareDecision::Stop {
-                return Err(pingora::Error::explain(
+                return Err(Error::explain(
                     pingora::ErrorType::Custom("MiddlewareRejected"),
                     "Upstream Request Rejected"
                 ));
@@ -211,30 +211,6 @@ impl ProxyHttp for Gateway {
         Ok(())
     }
 
-    async fn connected_to_upstream(
-        &self,
-        session: &mut Session,
-        reused: bool,
-        peer: &HttpPeer,
-        fd: RawFd,
-        digest: Option<&Digest>,
-        ctx: &mut Self::CTX
-    ) -> pingora::Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        for middleware in &self.middlewares {
-            let result = middleware.handle_upstream_connected(session, reused, peer, fd, digest, ctx).await?;
-            if result == MiddlewareDecision::Stop {
-                return Err(pingora::Error::explain(
-                    pingora::ErrorType::Custom("MiddlewareRejected"),
-                    "Upstream Connection Aborted"
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn upstream_response_filter(
         &self,
         session: &mut Session,
@@ -244,7 +220,7 @@ impl ProxyHttp for Gateway {
         for middleware in self.middlewares.iter().rev() {
             let result = middleware.handle_upstream_response(session, upstream_response, ctx)?;
             if result == MiddlewareDecision::Stop {
-                return Err(pingora::Error::explain(
+                return Err(Error::explain(
                     pingora::ErrorType::Custom("MiddlewareRejected"),
                     "Upstream Response Filter Aborted"
                 ));
@@ -271,7 +247,7 @@ impl ProxyHttp for Gateway {
         for middleware in self.middlewares.iter().rev() {
             let result = middleware.handle_response(session, upstream_response, ctx).await?;
             if result == MiddlewareDecision::Stop {
-                return Err(pingora::Error::explain(
+                return Err(Error::explain(
                     pingora::ErrorType::Custom("MiddlewareRejected"),
                     "Response Filter Aborted"
                 ));
@@ -298,7 +274,7 @@ impl ProxyHttp for Gateway {
         for middleware in self.middlewares.iter().rev() {
             let result = middleware.handle_response_body(session, body, end_of_stream, ctx)?;
             if result == MiddlewareDecision::Stop {
-                return Err(pingora::Error::explain(
+                return Err(Error::explain(
                     pingora::ErrorType::Custom("MiddlewareRejected"),
                     "Response Body Rejected")
                 )
@@ -324,25 +300,22 @@ impl ProxyHttp for Gateway {
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
-        e: &pingora::Error,
+        e: &Error,
         ctx: &mut Self::CTX
-    ) -> pingora::proxy::FailToProxy
+    ) -> FailToProxy
     where
         Self::CTX: Send + Sync,
     {
-        // 1. Middleware Hook (Reverse Order)
         for middleware in self.middlewares.iter().rev() {
             let result = middleware.handle_error(session, e, ctx)
                 .await
                 .unwrap_or(MiddlewareDecision::Continue);
 
-            // If a middleware handled it (e.g. wrote a response), we stop standard handling
             if result == MiddlewareDecision::Stop {
                 return FailToProxy { error_code: 0, can_reuse_downstream: false }
             }
         }
 
-        // 2. Determine Status Code based on Error Type
         let code = match e.etype {
             pingora::ErrorType::ConnectRefused
             | pingora::ErrorType::ConnectNoRoute
@@ -352,14 +325,11 @@ impl ProxyHttp for Gateway {
             _ => 500,
         };
 
-        // 3. Check for Custom Error Page configuration
         let mut error_page_served = false;
 
-        // We only have a RouteConf if routing succeeded before the error occurred
         if let Some(route) = ctx.get::<RouteConf>() {
             if let Some(pages) = &route.error_pages {
                 if let Some(path) = pages.get(&code) {
-                    // 4. Try to serve the custom page from disk
                     match tokio::fs::read(path).await {
                         Ok(content) => {
                             let mut header = ResponseHeader::build(code, Some(4)).unwrap();
@@ -373,7 +343,6 @@ impl ProxyHttp for Gateway {
                             }
                         },
                         Err(err) => {
-                            // Fallback if file is missing or unreadable
                             eprintln!("Failed to read custom error page '{}': {}", path, err);
                         }
                     }
@@ -381,7 +350,6 @@ impl ProxyHttp for Gateway {
             }
         }
 
-        // 5. Fallback: Default Pingora Error Page
         if !error_page_served {
             let _ = session.respond_error(code).await;
         }
@@ -390,5 +358,29 @@ impl ProxyHttp for Gateway {
             error_code: code,
             can_reuse_downstream: false,
         }
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        session: &mut Session,
+        reused: bool,
+        peer: &HttpPeer,
+        fd: RawFd,
+        digest: Option<&Digest>,
+        ctx: &mut Self::CTX
+    ) -> pingora::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        for middleware in &self.middlewares {
+            let result = middleware.handle_upstream_connected(session, reused, peer, fd, digest, ctx).await?;
+            if result == MiddlewareDecision::Stop {
+                return Err(Error::explain(
+                    pingora::ErrorType::Custom("MiddlewareRejected"),
+                    "Upstream Connection Aborted"
+                ));
+            }
+        }
+        Ok(())
     }
 }
