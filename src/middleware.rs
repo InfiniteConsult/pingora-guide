@@ -69,8 +69,8 @@ pub trait Middleware: Send + Sync {
         _session: &mut Session,
         _upstream_request: &mut RequestHeader,
         _ctx: &mut GatewayContext,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<MiddlewareDecision> {
+        Ok(MiddlewareDecision::Continue)
     }
 
     async fn handle_upstream_connected(
@@ -81,8 +81,8 @@ pub trait Middleware: Send + Sync {
         _fd: std::os::unix::io::RawFd,
         _digest: Option<&Digest>,
         _ctx: &mut GatewayContext,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<MiddlewareDecision> {
+        Ok(MiddlewareDecision::Continue)
     }
 
     async fn handle_upstream_response(
@@ -90,8 +90,8 @@ pub trait Middleware: Send + Sync {
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut GatewayContext,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<MiddlewareDecision> {
+        Ok(MiddlewareDecision::Continue)
     }
 
     async fn handle_error(
@@ -132,8 +132,8 @@ pub trait Middleware: Send + Sync {
         Ok(MiddlewareDecision::Continue)
     }
 
-    fn init_cache(&self, _session: &mut Session, _ctx: &mut GatewayContext) -> Result<()> {
-        Ok(())
+    fn init_cache(&self, _session: &mut Session, _ctx: &mut GatewayContext) -> Result<MiddlewareDecision> {
+        Ok(MiddlewareDecision::Continue)
     }
 
     fn cache_key(&self, _session: &Session, _ctx: &mut GatewayContext) -> Result<Option<CacheKey>> {
@@ -153,7 +153,7 @@ pub trait Middleware: Send + Sync {
         &self,
         _session: &mut Session,
         _e: Option<&Error>,
-        _ctx: &mut GatewayContext) -> () {
-        ()
+        _ctx: &mut GatewayContext) -> Result<MiddlewareDecision> {
+        Ok(MiddlewareDecision::Continue)
     }
 }
