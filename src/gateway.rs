@@ -40,6 +40,7 @@ use pingora::Error;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::{HttpPeer, ProxyHttp, Session};
 use pingora::protocols::Digest;
+use pingora::proxy::FailToProxy;
 use crate::config::{GatewayConf, RouteConf};
 use crate::context::{GatewayContext, RequestMeta};
 use crate::middleware::{Middleware, MiddlewareDecision};
@@ -317,6 +318,77 @@ impl ProxyHttp for Gateway {
             if result == MiddlewareDecision::Stop {
                 return
             }
+        }
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora::Error,
+        ctx: &mut Self::CTX
+    ) -> pingora::proxy::FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        // 1. Middleware Hook (Reverse Order)
+        for middleware in self.middlewares.iter().rev() {
+            let result = middleware.handle_error(session, e, ctx)
+                .await
+                .unwrap_or(MiddlewareDecision::Continue);
+
+            // If a middleware handled it (e.g. wrote a response), we stop standard handling
+            if result == MiddlewareDecision::Stop {
+                return FailToProxy { error_code: 0, can_reuse_downstream: false }
+            }
+        }
+
+        // 2. Determine Status Code based on Error Type
+        let code = match e.etype {
+            pingora::ErrorType::ConnectRefused
+            | pingora::ErrorType::ConnectNoRoute
+            | pingora::ErrorType::BindError => 502,
+            pingora::ErrorType::ReadTimedout
+            | pingora::ErrorType::ConnectTimedout => 504,
+            _ => 500,
+        };
+
+        // 3. Check for Custom Error Page configuration
+        let mut error_page_served = false;
+
+        // We only have a RouteConf if routing succeeded before the error occurred
+        if let Some(route) = ctx.get::<RouteConf>() {
+            if let Some(pages) = &route.error_pages {
+                if let Some(path) = pages.get(&code) {
+                    // 4. Try to serve the custom page from disk
+                    match tokio::fs::read(path).await {
+                        Ok(content) => {
+                            let mut header = ResponseHeader::build(code, Some(4)).unwrap();
+                            header.insert_header("Content-Type", "text/html").unwrap();
+                            header.insert_header("Content-Length", content.len().to_string()).unwrap();
+
+                            // Attempt to write. If client disconnected, this might fail, which is fine.
+                            if session.write_response_header(Box::new(header), false).await.is_ok() {
+                                let _ = session.write_response_body(Some(Bytes::from(content)), true).await;
+                                error_page_served = true;
+                            }
+                        },
+                        Err(err) => {
+                            // Fallback if file is missing or unreadable
+                            eprintln!("Failed to read custom error page '{}': {}", path, err);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Fallback: Default Pingora Error Page
+        if !error_page_served {
+            let _ = session.respond_error(code).await;
+        }
+
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
         }
     }
 }
