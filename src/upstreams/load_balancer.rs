@@ -86,7 +86,7 @@ where
                         if let Some(socket_ip) = ip.as_inet() {
                             socket_ip.ip().to_string()
                         } else {
-                            "unix_local".to_string()
+                            uuid::Uuid::new_v4().to_string()
                         }
                     },
                     None => String::new(),
