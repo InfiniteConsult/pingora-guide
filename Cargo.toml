@@ -28,6 +28,7 @@ clap = { version = "4.5.54", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 humantime-serde = "1.1.1"
 serde_yaml = "0.9"
+serde_json = { version = "1.0.149"}
 matchit = "0.9.1"
 regex = "1.12.2"
 uuid = { version = "1.19.0", features = ["fast-rng", "v4"]}
