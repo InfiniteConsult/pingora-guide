@@ -9,6 +9,7 @@ use http::Extensions;
 use log::{error, info};
 use tokio::net::lookup_host;
 
+// ErrorType variants exposed directly in prelude. IDE gives redundant prefix warnings
 use pingora::prelude::*;
 
 use pingora::lb::{LoadBalancer, Backends, Backend};
@@ -34,7 +35,7 @@ impl ServiceDiscovery for DnsDiscovery {
     async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
 
         let mut addrs = lookup_host(&self.hostname).await
-            .map_err(|_e| pingora::Error::new(ErrorType::Custom("DNSResolutionFailed")))?;
+            .map_err(|_e| pingora::Error::new(Custom("DNSResolutionFailed")))?;
 
 
         let mut upstreams: BTreeSet<Backend> = BTreeSet::new();
@@ -61,19 +62,19 @@ pub struct FileDiscovery {
 impl ServiceDiscovery for FileDiscovery {
     async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
         let content = tokio::fs::read_to_string(&self.path).await
-            .map_err(|e| Error::explain(ErrorType::InternalError, e.to_string()))?;
+            .map_err(|e| Error::explain(InternalError, e.to_string()))?;
 
         let backend_confs: Vec<BackendConf> = match self.format {
             FileFormat::Yaml => serde_yaml::from_str(&content)
-                .map_err(|e| Error::explain(ErrorType::InternalError, e.to_string()))?,
+                .map_err(|e| Error::explain(InternalError, e.to_string()))?,
             FileFormat::Json => serde_json::from_str(&content)
-                .map_err(|e| Error::explain(ErrorType::InternalError, e.to_string()))?,
+                .map_err(|e| Error::explain(InternalError, e.to_string()))?,
         };
 
         let mut upstreams = BTreeSet::new();
         for b_conf in backend_confs {
             let socket_addrs = b_conf.address.to_socket_addrs()
-                .map_err(|e| Error::explain(ErrorType::InternalError, e.to_string()))?;
+                .map_err(|e| Error::explain(InternalError, e.to_string()))?;
 
             for addr in socket_addrs {
                 let  backend = Backend {
@@ -86,4 +87,62 @@ impl ServiceDiscovery for FileDiscovery {
         }
         Ok((upstreams, HashMap::new()))
     }
+}
+
+pub struct CommandHealthCheck {
+    pub command: String,
+    pub timeout: Duration,
+    pub args: Vec<String>,
+    failure_threshold: usize,
+    success_threshold: usize,
+}
+
+impl CommandHealthCheck {
+    fn new(
+        command: String,
+        timeout: Duration,
+        args: Vec<String>,
+        failure_threshold: usize,
+        success_threshold: usize
+    ) -> Self {
+        Self {
+            command,
+            timeout,
+            args,
+            failure_threshold,
+            success_threshold
+        }
+    }
+}
+
+#[async_trait]
+impl HealthCheck for CommandHealthCheck {
+    async fn check(&self, target: &Backend) -> Result<()> {
+        let cmd_future = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&self.command)
+            .env("TARGET_IP", target.addr.to_string())
+            .output();
+
+        let output = match tokio::time::timeout(self.timeout, cmd_future).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(Error::explain(Custom("CommandFailed"), e.to_string())),
+            Err(_) => return Err(Error::explain(ReadTimedout, "Health check timed out")),
+        };
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(Error::explain(Custom("HealthCheckFailed"), "Non-zero exit code"))
+        }
+    }
+
+    fn health_threshold(&self, success: bool) -> usize {
+        if success {
+            self.success_threshold
+        } else {
+            self.failure_threshold
+        }
+    }
+
 }
