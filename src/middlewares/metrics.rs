@@ -87,7 +87,7 @@ impl Middleware for MetricsMiddleware {
         session: &mut Session,
         _e: Option<&Error>,
         ctx: &mut GatewayContext
-    ) {
+    ) -> Result<MiddlewareDecision> {
         // Use 'get' instead of 'get_mut' since we are only reading values
         let req_meta = ctx.get::<RequestMeta>();
 
@@ -127,5 +127,7 @@ impl Middleware for MetricsMiddleware {
                 eprintln!("Error: RequestMeta missing during logging phase.");
             }
         }
+
+        Ok(MiddlewareDecision::Continue)
     }
 }
