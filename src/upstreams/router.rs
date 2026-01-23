@@ -65,14 +65,6 @@ impl Router {
     }
 
     pub fn match_request(&self, path: &str, host: Option<&str>) -> Option<&RouteConf> {
-        for (re, id) in &self.regex_routes {
-            if re.is_match(path) {
-                let route = &self.route_registry[id];
-                if self.validate_host(route, host) {
-                    return Some(route)
-                }
-            }
-        }
 
         if let Ok(match_result)  = self.matchit_router.at(path) {
             let id = match_result.value;
@@ -87,6 +79,15 @@ impl Router {
             }
         }
 
+        for (re, id) in &self.regex_routes {
+            if re.is_match(path) {
+                let route = &self.route_registry[id];
+                if self.validate_host(route, host) {
+                    return Some(route)
+                }
+            }
+        }
+        
         None
     }
 
