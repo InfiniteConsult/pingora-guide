@@ -18,9 +18,9 @@ use pingora::lb::selection::consistent::KetamaHashing;
 use pingora::lb::discovery::ServiceDiscovery;
 use pingora::lb::health_check::{TcpHealthCheck, HealthCheck};
 use pingora::protocols::l4::socket::SocketAddr;
-use pingora::services::listening::Service;
+use pingora::services::Service as ServiceTrait;
 use pingora::services::background::BackgroundService;
-
+use pingora_load_balancing::health_check::HttpHealthCheck;
 use crate::config::{UpstreamConf, UpstreamSource, LoadBalancerSelection, HealthCheckConf, FileFormat, BackendConf};
 use crate::upstream::Upstream;
 use crate::upstreams::load_balancer::LoadBalancerCluster;
@@ -145,4 +145,64 @@ impl HealthCheck for CommandHealthCheck {
         }
     }
 
+}
+
+fn finalize_lb<S>(
+    mut lb: LoadBalancer<S>,
+    conf: &UpstreamConf
+) -> (Arc<LoadBalancer<S>>, Vec<Box<dyn ServiceTrait>>)
+where
+    S: BackendSelection + 'static + Send + Sync,
+    S::Iter: BackendIter,
+{
+    if let Some(hc_conf) = &conf.health_check {
+        match hc_conf {
+            HealthCheckConf::Tcp(common) => {
+                let mut hc = TcpHealthCheck::new();
+                hc.peer_template.options.connection_timeout = Some(common.timeout);
+                hc.consecutive_success = common.consecutive_success;
+                hc.consecutive_failure = common.consecutive_failure;
+
+                lb.set_health_check(hc);
+                lb.health_check_frequency = Some(common.interval);
+            },
+            HealthCheckConf::Http { common, path, expected_status: _ } => {
+                let host = match &conf.source {
+                    UpstreamSource::Dns { hostname, .. } => hostname.clone(),
+                    _ => "localhost".to_string(),
+                };
+
+                let mut hc = HttpHealthCheck::new(&host, conf.options.tls);
+                hc.peer_template.options.connection_timeout = Some(common.timeout);
+                hc.consecutive_success = common.consecutive_success;
+                hc.consecutive_failure = common.consecutive_failure;
+
+                if let Ok(uri) = path.parse::<http::Uri>() {
+                    hc.req.set_uri(uri);
+                }
+
+                lb.set_health_check(Box::new(hc));
+                lb.health_check_frequency = Some(common.interval);
+            },
+            HealthCheckConf::Custom { common, command } => {
+                let hc = CommandHealthCheck::new(
+                    command.clone(),
+                    common.timeout,
+                    vec![],
+                    common.consecutive_failure,
+                    common.consecutive_success
+                );
+                lb.set_health_check(Box::new(hc));
+                lb.health_check_frequency = Some(common.interval);
+            }
+        }
+    }
+
+    lb.parallel_health_check = true;
+
+    let background = background_service(format!("lb-{}", conf.id).as_str(), lb);
+
+    let lb_arc = background.task();
+
+    (lb_arc, vec![Box::new(background)])
 }
