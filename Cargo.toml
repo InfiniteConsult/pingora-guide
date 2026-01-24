@@ -3,6 +3,14 @@ name = "pingora-guide"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "pingora_guide"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pingora-guide"
+path = "src/main.rs"
+
 [dependencies]
 pingora = { version = "0.6.0", features = ["openssl", "proxy", "lb", "cache"] }
 pingora-load-balancing = { version = "0.6.0", features = ["openssl"]}
@@ -35,3 +43,4 @@ uuid = { version = "1.19.0", features = ["fast-rng", "v4"]}
 
 thiserror = "2.0.17"
 chrono = "0.4.42"
+num_cpus = "1.17.0"
