@@ -27,7 +27,7 @@ use pingora::upstreams::peer::ALPN;
 use crate::context::{GatewayContext, RequestMeta};
 use crate::upstream::Upstream;
 use crate::config::ClusterOptions;
-use crate::error::Result;
+use crate::error::{PingoraGuideError, Result};
 
 
 pub struct StaticUpstream {
@@ -36,6 +36,7 @@ pub struct StaticUpstream {
     sni: String,
     client_cert: Option<Arc<CertKey>>,
     options: ClusterOptions,
+    is_uds: bool,
 }
 
 impl StaticUpstream {
@@ -44,20 +45,39 @@ impl StaticUpstream {
         tls: bool,
         sni: String,
         client_cert: Option<Arc<CertKey>>,
-        options: Option<ClusterOptions>
+        options: Option<ClusterOptions>,
     ) -> Self {
-        StaticUpstream { addr, tls, sni, client_cert, options: options.unwrap_or_default() }
+        StaticUpstream {
+            addr,
+            tls,
+            sni,
+            client_cert,
+            options: options.unwrap_or_default(),
+            is_uds: false
+        }
+    }
+
+    pub fn new_uds(path: String, options: ClusterOptions) -> Self {
+        StaticUpstream {
+            addr: (path, 0),
+            tls: false,
+            sni: String::new(),
+            client_cert: None,
+            options,
+            is_uds: true,
+        }
     }
 }
 
 #[async_trait]
 impl Upstream for StaticUpstream {
     async fn select_peer(&self, _session: &mut Session, ctx: &mut GatewayContext) -> Result<Box<HttpPeer>> {
-        let mut peer = HttpPeer::new(
-            self.addr.clone(),
-            self.tls,
-            self.sni.clone(),
-        );
+        let mut peer = if self.is_uds {
+            HttpPeer::new_uds(&self.addr.0, self.tls, self.sni.clone())
+                .map_err(|e| *e)?
+        } else {
+            HttpPeer::new(self.addr.clone(), self.tls, self.sni.clone())
+        };
 
         if let Some(meta) = ctx.get_mut::<RequestMeta>() {
             meta.peer_addr = Some(peer.address().clone());
