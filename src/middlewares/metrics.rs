@@ -69,19 +69,6 @@ impl Middleware for MetricsMiddleware {
         "metrics"
     }
 
-    async fn handle_request(
-        &self,
-        _session: &mut Session,
-        ctx: &mut GatewayContext
-    ) -> Result<MiddlewareDecision> {
-        let req_meta = ctx.get_mut::<RequestMeta>();
-        match req_meta {
-            Some(meta) => { meta.start_time = Instant::now() },
-            None => { ctx.insert(RequestMeta::default()); }
-        }
-        Ok(MiddlewareDecision::Continue)
-    }
-
     async fn handle_logging(
         &self,
         session: &mut Session,
