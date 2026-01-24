@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-#[cfg(unix)]
-
 use clap::Parser;
 use log::{info, error};
 
