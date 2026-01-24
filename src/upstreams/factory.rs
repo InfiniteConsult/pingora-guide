@@ -6,20 +6,17 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use http::Extensions;
-use log::{error, info};
 use tokio::net::lookup_host;
 
-// ErrorType variants exposed directly in prelude. IDE gives redundant prefix warnings
 use pingora::prelude::*;
 
 use pingora::lb::{LoadBalancer, Backends, Backend};
-use pingora::lb::selection::{RoundRobin, BackendSelection, BackendIter};
+use pingora::lb::selection::{RoundRobin, BackendSelection, BackendIter, Random};
 use pingora::lb::selection::consistent::KetamaHashing;
-use pingora::lb::discovery::ServiceDiscovery;
+use pingora::lb::discovery::{ServiceDiscovery, Static};
 use pingora::lb::health_check::{TcpHealthCheck, HealthCheck};
 use pingora::protocols::l4::socket::SocketAddr;
 use pingora::services::Service as ServiceTrait;
-use pingora::services::background::BackgroundService;
 use pingora_load_balancing::health_check::HttpHealthCheck;
 use crate::config::{UpstreamConf, UpstreamSource, LoadBalancerSelection, HealthCheckConf, FileFormat, BackendConf};
 use crate::upstream::Upstream;
@@ -205,4 +202,88 @@ where
     let lb_arc = background.task();
 
     (lb_arc, vec![Box::new(background)])
+}
+
+fn make_lb_instance<S>(
+    conf: &UpstreamConf,
+) -> Result<(Box<dyn Upstream>, Vec<Box<dyn ServiceTrait>>)>
+where
+    S: BackendSelection + 'static + Send + Sync,
+    S::Iter: BackendIter,
+{
+    let mut lb: LoadBalancer<S> = match &conf.source {
+        UpstreamSource::Static { backends } => {
+            let mut upstreams = BTreeSet::new();
+            for b_conf in backends {
+                let addrs = b_conf.address.to_socket_addrs()
+                    .map_err(|e| Error::explain(ErrorType::InternalError, e.to_string()))?;
+
+                for addr in addrs {
+                    upstreams.insert(Backend {
+                        addr: SocketAddr::Inet(addr),
+                        weight: b_conf.weight as usize,
+                        ext: Extensions::new(),
+                    });
+                }
+            }
+            let discovery = Static::new(upstreams);
+            let backends = Backends::new(discovery);
+            LoadBalancer::from_backends(backends)
+        },
+        UpstreamSource::Dns { hostname, refresh_interval } => {
+            let discovery = DnsDiscovery {
+                hostname: hostname.clone(),
+            };
+            let backends = Backends::new(Box::new(discovery));
+            let mut lb = LoadBalancer::from_backends(backends);
+            lb.update_frequency = Some(*refresh_interval);
+            lb
+        },
+        UpstreamSource::File { path, format, refresh_interval } => {
+            let discovery = FileDiscovery {
+                path: PathBuf::from(path),
+                format: format.clone(),
+            };
+            let backends = Backends::new(Box::new(discovery));
+            let mut lb = LoadBalancer::from_backends(backends);
+            lb.update_frequency = Some(*refresh_interval);
+            lb
+        },
+        UpstreamSource::Uds { .. } => {
+            return Err(Error::explain(
+                ErrorType::Custom("InvalidConfiguration"),
+                "Unix Domain Sockets cannot be used with Load Balancer Selection algorithms."
+            ));
+        }
+    };
+
+    let (shared_lb, services) = finalize_lb(lb, conf);
+
+    let cluster = LoadBalancerCluster::new(
+        shared_lb,
+        conf.options.tls,
+        conf.options.sni.clone().unwrap_or_default(),
+        None,
+        Some(conf.options.clone()),
+        Some(conf.hash_source.clone())
+    );
+
+    Ok((Box::new(cluster), services))
+}
+
+pub fn make_upstream(
+    conf: &UpstreamConf
+) -> Result<(Box<dyn Upstream>, Vec<Box<dyn ServiceTrait>>)> {
+    if let UpstreamSource::Uds { path } = &conf.source {
+        let upstream = StaticUpstream::new_uds(path.clone(), conf.options.clone());
+        return Ok((Box::new(upstream), vec![]));
+    }
+
+    match conf.selection {
+        LoadBalancerSelection::RoundRobin => make_lb_instance::<RoundRobin>(conf),
+        LoadBalancerSelection::Consistent => make_lb_instance::<KetamaHashing>(conf),
+        LoadBalancerSelection::Random => {
+            make_lb_instance::<Random>(conf)
+        }
+    }
 }
