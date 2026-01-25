@@ -213,14 +213,6 @@ mod tests {
                 hostnames: None,
                 ..RouteConf::default()
             },
-            // [Route 4]: Broken Route (No leading slash)
-            RouteConf {
-                path: "invalid/path".to_string(),
-                path_type: PathType::Prefix,
-                upstream_id: "garbage".to_string(),
-                hostnames: None,
-                ..RouteConf::default()
-            },
         ];
 
         let conf = GatewayConf {
@@ -297,12 +289,23 @@ mod tests {
 
     #[test]
     fn invalid_route_skipped() {
-        // TC-07: The 'invalid/path' route should simply not exist in the router.
-        let router = make_test_router();
-        let result = router.match_request("invalid/path", None);
-        // Note: Pingora usually normalizes paths to start with /, so checking "invalid/path"
-        // directly tests if it ended up in matchit (which it shouldn't have).
-        assert!(result.is_none());
+        let routes = vec![
+            // [Route 4]: Broken Route (No leading slash)
+            RouteConf {
+                path: "invalid/path".to_string(),
+                path_type: PathType::Prefix,
+                upstream_id: "garbage".to_string(),
+                hostnames: None,
+                ..RouteConf::default()
+            },
+        ];
+
+        let conf = GatewayConf {
+            routes,
+            ..GatewayConf::default()
+        };
+
+        assert!(Router::new(&conf).is_err())
     }
 
     #[test]
