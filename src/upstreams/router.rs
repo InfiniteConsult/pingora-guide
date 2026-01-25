@@ -18,50 +18,119 @@
 //!         * If found: Call `select_peer()` on the matched child upstream.
 //!         * If not found: Return `Err(Error::Gateway(GatewayError::NoRouteMatched))`
 //!           (which typically translates to a 404).
+use std::str::FromStr;
 use std::sync::Arc;
 use std::collections::HashMap;
 use regex::Regex;
-use crate::config::{RouteConf, GatewayConf, PathType};
+use ipnet::IpNet;
+use crate::config::{RouteConf, GatewayConf, PathType, AccessControlConf};
+use crate::error::{GatewayError, PingoraGuideError, Result};
+use crate::middleware::MiddlewareDecision;
+
+#[derive(Debug, Clone)]
+pub struct CompiledAccessControl {
+    pub allow: Vec<IpNet>,
+    pub deny: Vec<IpNet>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteEntry {
+    pub conf: Arc<RouteConf>,
+    pub access_control: Option<Arc<CompiledAccessControl>>
+}
 
 #[derive(Debug)]
 pub struct Router {
     pub regex_routes: Vec<(Regex, usize)>,
     pub matchit_router: matchit::Router<usize>,
-    pub route_registry: HashMap<usize, Arc<RouteConf>>
+    pub route_registry: HashMap<usize, RouteEntry>
 }
 
 impl Router {
-    pub fn new(conf: &GatewayConf) -> Self {
+    pub fn new(conf: &GatewayConf) -> Result<Self> {
         let mut regex_routes: Vec<(Regex, usize)> = Vec::new();
         let mut matchit_router: matchit::Router<usize> = matchit::Router::new();
-        let mut route_registry: HashMap<usize, Arc<RouteConf>> = HashMap::new();
+        let mut route_registry: HashMap<usize, RouteEntry> = HashMap::new();
 
         for (idx, route) in conf.routes.iter().enumerate() {
-            route_registry.insert(idx, Arc::new(route.clone()));
             match route.path_type {
                 PathType::Regex => {
-                    let re = Regex::new(&route.path).expect("Invalid Regex in configuration");
+                    let re = match Regex::new(&route.path) {
+                        Ok(re) => re,
+                        Err(e) => {
+                            return Err(PingoraGuideError::Gateway(GatewayError::RouteError(format!(
+                                "Invalid Regex in configuration '{}': {}",
+                                route.path,
+                                e
+                            ))));
+                        }
+                    };
                     regex_routes.push((re, idx));
                 },
                 PathType::Prefix | PathType::Exact => {
                     if !route.path.starts_with('/') {
-                        eprintln!("Warning: Prefix route '{}' does not start with '/'", route.path);
-                        continue;
+                        return Err(PingoraGuideError::Gateway(GatewayError::RouteError(format!(
+                            "Warning: Prefix route '{}' does not start with '/'",
+                            route.path
+                        ))));
+
                     }
 
                     match matchit_router.insert(&route.path, idx) {
                         Ok(_) => {},
-                        Err(e) => { eprintln!("Failed to insert route '{}': {}", route.path, e); }
+                        Err(e) => {
+                            return Err(PingoraGuideError::Gateway(GatewayError::RouteError(format!(
+                                "Failed to insert route '{}': {}",
+                                route.path,
+                                e
+                            ))));
+                        }
                     }
                 }
             }
+
+            let mut acl_option: Option<Arc<CompiledAccessControl>> = None;
+            if route.access_control.is_some() {
+                let mut compiled_acl = CompiledAccessControl {
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                };
+
+                let acl = route.access_control.as_ref().unwrap();
+                for deny_block in &acl.deny {
+                    let deny_range = match IpNet::from_str(deny_block) {
+                        Ok(ip_range) => ip_range,
+                        Err(e) => return Err(PingoraGuideError::Gateway(GatewayError::AclError(e.to_string())))
+                    };
+                    compiled_acl.deny.push(deny_range);
+                }
+
+                for allow_block in &acl.allow {
+                    let allow_range = match IpNet::from_str(allow_block) {
+                        Ok(ip_range) => ip_range,
+                        Err(e) => return Err(PingoraGuideError::Gateway(GatewayError::AclError(e.to_string())))
+                    };
+                    compiled_acl.allow.push(allow_range);
+                }
+
+                if !compiled_acl.allow.is_empty() || !compiled_acl.deny.is_empty() {
+                    acl_option = Some(Arc::new(compiled_acl));
+                }
+            }
+
+            let route_entry = RouteEntry {
+                conf: Arc::new(route.clone()),
+                access_control: acl_option
+            };
+
+            route_registry.insert(idx, route_entry);
         }
 
-        Self {
+        Ok(Self {
             regex_routes,
             matchit_router,
             route_registry
-        }
+        })
     }
 
     pub fn match_request(&self, path: &str, host: Option<&str>) -> Option<&RouteConf> {

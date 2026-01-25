@@ -36,6 +36,7 @@ pub enum GatewayError {
     AuthFailure,
     RateLimited,
     AclError(String),
+    RouteError(String),
     InvalidRequest(String),
     InternalError(String),
 }

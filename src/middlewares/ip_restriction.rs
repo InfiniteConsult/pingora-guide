@@ -28,7 +28,6 @@
 use std::str::FromStr;
 use async_trait::async_trait;
 use ipnet::IpNet;
-use pingora::prelude::Error as PingoraError;
 use pingora::prelude::Session;
 
 use crate::config::RouteConf;
