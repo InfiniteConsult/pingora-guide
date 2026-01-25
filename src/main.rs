@@ -22,6 +22,7 @@ use pingora_guide::config::GatewayConf;
 use pingora_guide::gateway::Gateway;
 use pingora_guide::middleware::Middleware;
 use pingora_guide::middlewares::metrics::MetricsMiddleware;
+use pingora_guide::middlewares::ip_restriction::IpRestrictionMiddleware;
 use pingora_guide::upstream::Upstream;
 use pingora_guide::upstreams::factory;
 use pingora_guide::upstreams::router::Router;
@@ -117,9 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Metrics (Start Timer)
     middlewares.push(Box::new(MetricsMiddleware::new()));
-
+    middlewares.push(Box::new(IpRestrictionMiddleware));
     // --- FUTURE MIDDLEWARES ---
-    // middlewares.push(Box::new(IpRestrictionMiddleware::new(&conf.security)));
     // middlewares.push(Box::new(RequestSizeMiddleware::new(&conf.server)));
     // middlewares.push(Box::new(AuthMiddleware::new()));
     // middlewares.push(Box::new(RateLimitMiddleware::new()));
