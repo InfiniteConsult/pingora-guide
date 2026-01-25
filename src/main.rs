@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let router = Router::new(&conf);
+    let router = Router::new(&conf)?;
 
     let mut middlewares: Vec<Box<dyn Middleware>> = Vec::new();
 

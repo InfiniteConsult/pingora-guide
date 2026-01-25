@@ -116,8 +116,8 @@ impl ProxyHttp for Gateway {
             Some(route_match) => { route_match },
             None => { session.respond_error(404).await?; return Ok(true); }
         };
-        req_meta.matched_route_id = Some(route.path.clone());
-        req_meta.upstream_id = Some(route.upstream_id.clone());
+        req_meta.matched_route_id = Some(route.conf.path.clone());
+        req_meta.upstream_id = Some(route.conf.upstream_id.clone());
         ctx.insert(route.clone());
 
         for middleware in &self.middlewares {
