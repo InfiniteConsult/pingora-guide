@@ -119,6 +119,7 @@ impl ProxyHttp for Gateway {
         req_meta.matched_route_id = Some(route.conf.path.clone());
         req_meta.upstream_id = Some(route.conf.upstream_id.clone());
         ctx.insert(route.clone());
+        ctx.insert(route.conf.clone());
 
         for middleware in &self.middlewares {
             let result = middleware.handle_request(session, ctx).await?;
