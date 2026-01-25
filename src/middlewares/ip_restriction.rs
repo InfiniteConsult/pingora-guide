@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use ipnet::IpNet;
 use pingora::prelude::Session;
 
-use crate::config::RouteConf;
+use crate::upstreams::router::RouteEntry;
 use crate::context::GatewayContext;
 use crate::error::{GatewayError, PingoraGuideError, Result};
 use crate::middleware::{Middleware, MiddlewareDecision};
@@ -47,10 +47,12 @@ impl Middleware for IpRestrictionMiddleware {
         &self, session: &mut Session,
         ctx: &mut GatewayContext
     ) -> Result<MiddlewareDecision> {
-        let route = match ctx.get::<RouteConf>() {
+        let route = match ctx.get::<RouteEntry>() {
             Some(r) => r,
             None => return Ok(MiddlewareDecision::Continue)
         };
+
+
         let acl = match &route.access_control {
             Some(acl) => acl,
             None => return Ok(MiddlewareDecision::Continue)
@@ -66,11 +68,7 @@ impl Middleware for IpRestrictionMiddleware {
         let ip = sock_addr.ip();
 
         for deny_block in &acl.deny {
-            let deny_range = match IpNet::from_str(deny_block) {
-                Ok(ip_range) => ip_range,
-                Err(e) => return Err(PingoraGuideError::Gateway(GatewayError::AclError(e.to_string())))
-            };
-            if deny_range.contains(&ip) {
+             if deny_block.contains(&ip) {
                 session.respond_error(403)
                     .await
                     .map_err(|e| {
@@ -81,12 +79,7 @@ impl Middleware for IpRestrictionMiddleware {
         }
 
         for allow_block in &acl.allow {
-            let allow_range = match IpNet::from_str(allow_block) {
-                Ok(ip_range) => ip_range,
-                Err(e) => return Err(PingoraGuideError::Gateway(GatewayError::AclError(e.to_string())))
-            };
-
-            if allow_range.contains(&ip) {
+            if allow_block.contains(&ip) {
                 return Ok(MiddlewareDecision::Continue);
             }
         }
