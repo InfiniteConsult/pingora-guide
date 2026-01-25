@@ -24,3 +24,83 @@
 //!             * Log a warning.
 //!             * Call `session.respond_error(403)`.
 //!             * Return `Ok(MiddlewareDecision::Stop)`.
+
+use std::str::FromStr;
+use async_trait::async_trait;
+use ipnet::IpNet;
+use pingora::prelude::Error as PingoraError;
+use pingora::prelude::Session;
+
+use crate::config::RouteConf;
+use crate::context::GatewayContext;
+use crate::error::{GatewayError, PingoraGuideError, Result};
+use crate::middleware::{Middleware, MiddlewareDecision};
+
+pub struct IpRestrictionMiddleware;
+
+#[async_trait]
+impl Middleware for IpRestrictionMiddleware {
+    fn name(&self) -> &str {
+        "ip_restriction"
+    }
+
+    async fn handle_request(
+        &self, session: &mut Session,
+        ctx: &mut GatewayContext
+    ) -> Result<MiddlewareDecision> {
+        let route = match ctx.get::<RouteConf>() {
+            Some(r) => r,
+            None => return Ok(MiddlewareDecision::Continue)
+        };
+        let acl = match &route.access_control {
+            Some(acl) => acl,
+            None => return Ok(MiddlewareDecision::Continue)
+        };
+
+        let sock_addr = match session.client_addr() {
+            Some(ip) => match ip.as_inet() {
+                Some(inet_ip) => inet_ip,
+                None => return Ok(MiddlewareDecision::Continue)
+            },
+            None => return Ok(MiddlewareDecision::Continue)
+        };
+        let ip = sock_addr.ip();
+
+        for deny_block in &acl.deny {
+            let deny_range = match IpNet::from_str(deny_block) {
+                Ok(ip_range) => ip_range,
+                Err(e) => return Err(PingoraGuideError::Gateway(GatewayError::AclError(e.to_string())))
+            };
+            if deny_range.contains(&ip) {
+                session.respond_error(403)
+                    .await
+                    .map_err(|e| {
+                        PingoraGuideError::Gateway(GatewayError::AclError(e.to_string()))
+                    })?;
+                return Ok(MiddlewareDecision::Stop);
+            }
+        }
+
+        for allow_block in &acl.allow {
+            let allow_range = match IpNet::from_str(allow_block) {
+                Ok(ip_range) => ip_range,
+                Err(e) => return Err(PingoraGuideError::Gateway(GatewayError::AclError(e.to_string())))
+            };
+
+            if allow_range.contains(&ip) {
+                return Ok(MiddlewareDecision::Continue);
+            }
+        }
+
+        if !acl.allow.is_empty() {
+            session.respond_error(403)
+                .await
+                .map_err(|e| {
+                    PingoraGuideError::Gateway(GatewayError::AclError(e.to_string()))
+                })?;
+            Ok(MiddlewareDecision::Stop)
+        } else {
+            Ok(MiddlewareDecision::Continue)
+        }
+    }
+}
