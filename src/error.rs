@@ -35,6 +35,7 @@ pub enum GatewayError {
     UpstreamUnavailable,
     AuthFailure,
     RateLimited,
+    SizeLimited(String),
     AclError(String),
     RouteError(String),
     InvalidRequest(String),
