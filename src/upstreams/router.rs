@@ -133,17 +133,17 @@ impl Router {
         })
     }
 
-    pub fn match_request(&self, path: &str, host: Option<&str>) -> Option<&RouteConf> {
+    pub fn match_request(&self, path: &str, host: Option<&str>) -> Option<&RouteEntry> {
 
         if let Ok(match_result)  = self.matchit_router.at(path) {
             let id = match_result.value;
             let route = &self.route_registry[id];
 
-            if matches!(route.path_type, PathType::Exact) && path != route.path {
+            if matches!(route.conf.path_type, PathType::Exact) && path != route.conf.path {
                 return None;
             }
 
-            if self.validate_host(route, host) {
+            if self.validate_host(route.conf.as_ref(), host) {
                 return Some(route)
             }
         }
@@ -151,7 +151,7 @@ impl Router {
         for (re, id) in &self.regex_routes {
             if re.is_match(path) {
                 let route = &self.route_registry[id];
-                if self.validate_host(route, host) {
+                if self.validate_host(route.conf.as_ref(), host) {
                     return Some(route)
                 }
             }
@@ -178,7 +178,6 @@ mod tests {
     use super::*;
     use crate::config::{RouteConf, PathType};
 
-    // Helper to create the standard "Kitchen Sink" test configuration
     // Helper to create the standard "Kitchen Sink" test configuration
     fn make_test_router() -> Router {
         let routes = vec![
@@ -229,7 +228,7 @@ mod tests {
             ..GatewayConf::default()
         };
 
-        Router::new(&conf)
+        Router::new(&conf).unwrap()
     }
 
     // --- Regex Tests ---
@@ -240,7 +239,7 @@ mod tests {
         let result = router.match_request("/api/v1/user", Some("any.com"));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().upstream_id, "api-cluster");
+        assert_eq!(result.unwrap().conf.upstream_id, "api-cluster");
     }
 
     #[test]
@@ -250,7 +249,7 @@ mod tests {
         let result = router.match_request("/admin/settings", Some("admin.local"));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().upstream_id, "admin-cluster");
+        assert_eq!(result.unwrap().conf.upstream_id, "admin-cluster");
     }
 
     #[test]
@@ -272,7 +271,7 @@ mod tests {
         let result = router.match_request("/static/css/style.css", Some("foo.com"));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().upstream_id, "static-cluster");
+        assert_eq!(result.unwrap().conf.upstream_id, "static-cluster");
     }
 
     #[test]
@@ -282,7 +281,7 @@ mod tests {
         let result = router.match_request("/login", Some("bar.com"));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().upstream_id, "auth-cluster");
+        assert_eq!(result.unwrap().conf.upstream_id, "auth-cluster");
     }
 
     #[test]
