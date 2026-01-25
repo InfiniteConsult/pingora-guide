@@ -48,6 +48,8 @@
 * [Lesson 44: Respecting Cache-Control Headers](#lesson-44-respecting-cache-control-headers)
 * [Lesson 45: Cache Locking (Request Coalescing)](#lesson-45-cache-locking-request-coalescing)
 * [Lesson 46: Cache Purging](#lesson-46-cache-purging)
+* [Lesson 47: Stale While Revalidate](#lesson-47-stale-while-revalidate-swr)
+* [Lesson 48: Observability](#lesson-48-observability)
 
 
 # Quick Start: The "Pingora City" Lab
